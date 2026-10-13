@@ -1,0 +1,2 @@
+# Locked Linux x86_64 / CPython 3.13 PostgreSQL driver.
+psycopg2-binary==2.9.12 --hash=sha256:c41321a14dd74aceb6a9a643b9253a334521babfa763fa873e33d89cfa122fb5
