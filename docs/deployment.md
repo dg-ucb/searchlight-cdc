@@ -30,7 +30,9 @@ Infrastructure administrators publish two SecureString documents per environment
 
 The private infrastructure Terraform owns these parameters. Developers do not add tfvars, backend values, credentials, account details or secrets to this repository. The pipeline writes temporary input files outside the source artifact and removes them when the helper exits. Saved Terraform plans still contain sensitive inputs and must remain private and encrypted.
 
-Reuse the existing Lambda Terraform state and import any missing existing resources once before enabling releases. Retire the previous root managing those same resources. This Terraform manages the Lambda, selected layer references, execution role/policies, FIFO queue and SQS mapping; it uses existing networking, database and Secrets Manager resources. SQL migrations are a separate operation.
+Reuse the existing Lambda Terraform state and import any missing existing resources owned by that state once before enabling releases. Retire the previous root managing those same resources. This Terraform manages the Lambda, selected layer references, execution role/policies and SQS mapping; it uses existing networking, database and Secrets Manager resources. SQL migrations are a separate operation.
+
+Queue ownership is explicit in the private environment inputs. `manage_queue` defaults to `true` to preserve existing Lambda-managed queues through a state-address move. Set `"manage_queue": false` for an existing queue owned by another stack: the Lambda root reads it by name, the private pipeline removes queue write permissions, and no queue settings are changed. Do not import an externally owned queue into this state. The guard blocks destructive ownership changes; a partial failed Apply must be followed by a fresh plan and approval using the retained state.
 
 Set `DB_NAME` and `DB_SECRET_NAME` in the private environment configuration. Passwords remain in Secrets Manager. Enable `function_response_types = ["ReportBatchItemFailures"]` so failed CDC messages are retried, and leave deployed `LOCAL_DEV` unset.
 

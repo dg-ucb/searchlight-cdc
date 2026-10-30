@@ -1,6 +1,6 @@
 # Application Terraform
 
-This directory contains the Lambda Terraform supplied for the existing deployment, with its environment-specific values replaced by variables. It manages the function, execution role, original policy attachments, FIFO queue, and SQS event source mapping. Dependencies can use pinned shared layer versions or two function-specific layers. It does not create databases, VPCs, subnets, security groups, pipelines, or a state backend.
+This directory contains the Lambda Terraform supplied for the existing deployment, with its environment-specific values replaced by variables. It manages the function, execution role, original policy attachments, and SQS event source mapping. The FIFO queue can be managed here or read from its owning stack. Dependencies can use pinned shared layer versions or two function-specific layers. It does not create databases, VPCs, subnets, security groups, pipelines, or a state backend.
 
 The pipeline builds `dist/release/function.zip` and either downloads the exact shared `boto3.zip` and `psycopg2.zip` versions or builds the function-specific layers, then runs Terraform from this directory. Code hashes and selected layer versions are managed by Terraform; there is no code-change ignore rule and no SAM deployment.
 
@@ -29,9 +29,17 @@ Use `DB_SECRET_NAME` to reference an existing Secrets Manager secret. The applic
 
 The two original AWS-managed basic/SQS policy attachments are preserved. A separate VPC policy attachment supplies the network interface permissions required by this function. Supply `database_secret_arn` to grant runtime `GetSecretValue` access to that exact secret; supply `database_secret_kms_key_arn` as well if it uses a customer-managed KMS key. Terraform never retrieves the secret value. Leave these optional inputs null if another infrastructure component manages secret access. `additional_execution_policy_arns` can attach existing managed policies for other application services. Existing policies managed elsewhere remain attached.
 
+## Queue ownership
+
+`manage_queue` defaults to `true` for environments whose Lambda state already owns the queue. A moved block preserves that queue while changing its address from `aws_sqs_queue.cdc_events_q` to `aws_sqs_queue.cdc_events_q[0]`.
+
+For a queue owned by another infrastructure stack, set `"manage_queue": false` in the private environment JSON before applying the private pipeline configuration. This root then reads `data.aws_sqs_queue.existing[0]` by `queue_name`, validates its exact account/Region/name ARN, and uses that ARN for the mapping. Queue retention, encryption, policy, and other attributes remain the responsibility of the owning stack. The private pipeline removes queue write permissions in this mode. Do not import that queue into the Lambda state.
+
+The deployment guard rejects any managed queue record in an external-queue plan. Switching an already managed queue to external mode requires a separately reviewed ownership migration; changing this flag alone cannot delete or silently forget the queue. After a partial Apply failure, retain the application state, correct the inputs/source, and generate a new plan and approval.
+
 ## Existing state and first deployment
 
-Use the **same remote state key** that currently manages this Lambda deployment, and retire its old Terraform working directory before enabling the pipeline. Never let two Terraform roots own the same resources. The original resource addresses remain unchanged:
+Use the **same remote state key** that currently manages this Lambda deployment, and retire its old Terraform working directory before enabling the pipeline. Never let two Terraform roots own the same resources. The original resource addresses are:
 
 - `aws_lambda_function.cdc_handler`
 - `aws_iam_role.lambda_execution_role`
@@ -44,7 +52,7 @@ The original `data.aws_iam_policy_document.assume_role` and `data.aws_iam_policy
 
 If any existing resource is missing from that state, import it once through your infrastructure administration process before enabling the pipeline. Do not run an empty-state plan against an already deployed Lambda. A normal release should update code and layer versions while retaining the existing role, queue, and mapping. Inspect the first approved plan for unintended replacement, deletion, tag removal, or environment changes.
 
-The pipeline requires all six original managed addresses in existing state by default and rejects destructive changes, unexpected resources and state-only removal. A narrowly checked exception retires this function's own retained layer records when switching to pinned shared layers; their physical versions remain. The private infrastructure can disable the existing-state requirement for an intentional new installation. Migration from an older experimental deployment with hash-keyed layer resources needs a separately reviewed state migration; do not assume those layer addresses match this root.
+The pipeline requires the original managed addresses in existing state by default and rejects destructive changes, unexpected resources and state-only removal. Managed queue checks accept both the original and moved addresses. External-queue mode omits the queue from the required managed state. A narrowly checked exception retires this function's own retained layer records when switching to pinned shared layers; their physical versions remain. The private infrastructure can disable the existing-state requirement for an intentional new installation. Migration from an older experimental deployment with hash-keyed layer resources needs a separately reviewed state migration; do not assume those layer addresses match this root.
 
 Function-specific layers use `aws_lambda_layer_version.dependency["boto3"]` and `["psycopg2"]`. Each changed ZIP creates an immutable version, then Terraform attaches it to the Lambda. Previous versions have `skip_destroy = true` so a deployment cannot remove versions still used by another function or needed for rollback. Cleanup of old versions is a separate maintenance task. This retention also applies when destroying this Terraform root. In shared mode, this root only reads the exact versions resolved by Plan and never publishes or deletes them. Version defaults and one-run overrides are deployment inputs, so routine version changes do not require reapplying pipeline infrastructure.
 

@@ -67,6 +67,16 @@ class DeploymentTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 self.load(TFVARS | {key: 'wrong-target'})
 
+    def test_queue_ownership_is_a_boolean_scoped_by_private_permissions(self):
+        self.assertEqual(self.load(TFVARS | {'manage_queue': True})[0]['manage_queue'], True)
+        self.assertEqual(self.load(TFVARS | {'manage_queue': False}, extra={'EXPECTED_MANAGE_QUEUE': 'false'})[0]['manage_queue'], False)
+        for value in (False, 'false', 'true', 0, 1, None, [], {}):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'Queue ownership'):
+                self.load(TFVARS | {'manage_queue': value})
+        for expected in ('false', '', 'False', '1'):
+            with self.subTest(expected=expected), self.assertRaisesRegex(ValueError, 'Queue ownership'):
+                self.load(extra={'EXPECTED_MANAGE_QUEUE': expected})
+
     def test_backend_cannot_disable_locking_redirect_state_or_inject_credentials(self):
         for change in (
             {'key': 'other.tfstate'},
@@ -244,6 +254,24 @@ class DeploymentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             deploy.guard_plan({'complete': False}, TFVARS)
 
+    def test_external_queue_plans_cannot_adopt_change_or_destroy_the_queue(self):
+        configured = TFVARS | {'manage_queue': False}
+        deploy.guard_plan({'resource_changes': [
+            {'mode': 'data', 'address': 'data.aws_sqs_queue.existing[0]', 'change': {'actions': ['read']}},
+            {'address': 'aws_lambda_event_source_mapping.sqs_mapping', 'change': {'actions': ['create']}},
+        ]}, configured)
+        for address in sorted(deploy.QUEUES):
+            for actions in (['no-op'], ['create'], ['update'], ['delete'], ['create', 'delete'], ['delete', 'create'], ['forget']):
+                with self.subTest(address=address, actions=actions), self.assertRaisesRegex(ValueError, 'Unexpected managed resource'):
+                    deploy.guard_plan({'resource_changes': [{'address': address, 'change': {'actions': actions}}]}, configured)
+        for address in sorted(deploy.QUEUES):
+            for actions in (['no-op'], ['create'], ['update']):
+                with self.subTest(address=address, actions=actions):
+                    deploy.guard_plan({'resource_changes': [{'address': address, 'change': {'actions': actions}}]}, TFVARS)
+            for actions in (['delete'], ['create', 'delete'], ['delete', 'create'], ['forget']):
+                with self.subTest(address=address, actions=actions), self.assertRaisesRegex(ValueError, 'Destruction/replacement'):
+                    deploy.guard_plan({'resource_changes': [{'address': address, 'change': {'actions': actions}}]}, TFVARS)
+
     def test_shared_mode_only_retires_retained_layers_owned_by_this_function(self):
         configured = TFVARS | {'shared_layer_version_arns': SHARED}
         before = {
@@ -398,6 +426,50 @@ class DeploymentTests(unittest.TestCase):
                 build.assert_not_called()
                 tests.assert_not_called()
 
+    def test_existing_state_accepts_legacy_indexed_and_externally_owned_queue_modes(self):
+        base = deploy.CORE - deploy.QUEUES
+        cases = (
+            (True, base | {'aws_sqs_queue.cdc_events_q'}, True),
+            (True, base | {'aws_sqs_queue.cdc_events_q[0]'}, True),
+            (True, base, False),
+            (False, base, True),
+            (False, base - {'aws_lambda_event_source_mapping.sqs_mapping'}, False),
+        )
+        for managed, state, accepted in cases:
+            with self.subTest(managed=managed, state=state), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / 'source'
+                self.fixture(root)
+                configured = TFVARS | {'manage_queue': managed}
+                env = ENV | {
+                    'TFVARS_JSON': json.dumps(configured), 'BACKEND_JSON': json.dumps(BACKEND),
+                    'EXPECTED_MANAGE_QUEUE': str(managed).lower(), 'CODEBUILD_RESOLVED_SOURCE_VERSION': ENV['SOURCE_SHA'],
+                    'ARTIFACT_BUCKET': 'example-artifacts', 'ARTIFACT_KMS_KEY': 'example-key',
+                }
+
+                def fake_run(*args, **kwargs):
+                    if args[:2] == ('aws', 'sts'):
+                        return ENV['EXPECTED_ACCOUNT_ID']
+                    return {
+                        ('state', 'list'): '\n'.join(state),
+                        ('show', '-json'): '{}',
+                        ('show', '-no-color'): 'No changes.\n',
+                    }.get(args[2:4], '')
+
+                with (
+                    patch.dict(os.environ, env, clear=True),
+                    patch.object(deploy, 'WORK', Path(directory) / 'work'),
+                    patch.object(deploy, 'run', fake_run),
+                    patch.object(deploy, 'install_terraform', return_value='pinned-terraform'),
+                    patch.object(deploy, 'tests', side_effect=lambda work: (work / 'dist/unit-results.xml').write_text('<testsuite/>')),
+                    patch.object(deploy.package_lambda, 'build'),
+                    patch.object(deploy.package_lambda, 'smoke'),
+                ):
+                    if accepted:
+                        deploy.deploy('plan', root)
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'Existing Lambda state'):
+                            deploy.deploy('plan', root)
+
     def test_shared_apply_does_not_download_rebuild_or_retest_layer_packages(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / 'source'
@@ -524,6 +596,7 @@ class DeploymentTests(unittest.TestCase):
         other_bases = {name: arn.replace('shared-', 'other-') for name, arn in BASES.items()}
         changes = (
             {'TFVARS_JSON': json.dumps(configured | {'timeout': 60})},
+            {'TFVARS_JSON': json.dumps(configured | {'manage_queue': False}), 'EXPECTED_MANAGE_QUEUE': 'false'},
             {
                 'TFVARS_JSON': json.dumps(configured | {'shared_layer_version_arns': other_layers}),
                 'ALLOWED_SHARED_LAYER_ARNS': json.dumps(other_bases),

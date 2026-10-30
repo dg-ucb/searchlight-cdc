@@ -10,6 +10,8 @@ locals {
     } : {
     for dependency, layer in aws_lambda_layer_version.dependency : dependency => layer.arn
   }
+  queue_arn = var.manage_queue ? aws_sqs_queue.cdc_events_q[0].arn : data.aws_sqs_queue.existing[0].arn
+  queue_url = var.manage_queue ? aws_sqs_queue.cdc_events_q[0].url : data.aws_sqs_queue.existing[0].url
 }
 
 data "aws_partition" "current" {}
@@ -155,7 +157,25 @@ resource "aws_iam_role_policy_attachment" "additional_execution_policy" {
   role       = aws_iam_role.lambda_execution_role.name
 }
 
+moved {
+  from = aws_sqs_queue.cdc_events_q
+  to   = aws_sqs_queue.cdc_events_q[0]
+}
+
+data "aws_sqs_queue" "existing" {
+  count = var.manage_queue ? 0 : 1
+  name  = var.queue_name
+
+  lifecycle {
+    postcondition {
+      condition     = self.arn == "arn:${data.aws_partition.current.partition}:sqs:${var.region}:${var.allowed_account_id}:${var.queue_name}"
+      error_message = "The existing queue must match this environment's exact account, Region and FIFO queue name."
+    }
+  }
+}
+
 resource "aws_sqs_queue" "cdc_events_q" {
+  count                       = var.manage_queue ? 1 : 0
   name                        = var.queue_name
   delay_seconds               = var.queue_delay_seconds
   fifo_queue                  = true
@@ -176,7 +196,7 @@ data "aws_iam_policy_document" "sqs_policy" {
   statement {
     actions   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
     effect    = "Allow"
-    resources = [aws_sqs_queue.cdc_events_q.arn]
+    resources = [local.queue_arn]
   }
 }
 
@@ -186,7 +206,7 @@ resource "aws_iam_role_policy_attachment" "lambda_sqs_policy_attachment" {
 }
 
 resource "aws_lambda_event_source_mapping" "sqs_mapping" {
-  event_source_arn        = aws_sqs_queue.cdc_events_q.arn
+  event_source_arn        = local.queue_arn
   function_name           = aws_lambda_function.cdc_handler.function_name
   batch_size              = var.batch_size
   enabled                 = var.event_source_enabled

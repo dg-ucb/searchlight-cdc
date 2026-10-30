@@ -197,8 +197,15 @@ variable "shared_layer_version_arns" {
   }
 }
 
+variable "manage_queue" {
+  description = "Manage the FIFO queue in this Lambda state. False reads an existing queue owned by another stack without changing its attributes. Keep true for queues already managed here."
+  type        = bool
+  default     = true
+  nullable    = false
+}
+
 variable "queue_name" {
-  description = "Existing FIFO queue name for the CDC event source."
+  description = "FIFO queue name for the CDC event source, managed here or referenced from its owning stack."
   type        = string
 
   validation {

@@ -30,6 +30,7 @@ CORE = {
     'aws_lambda_event_source_mapping.sqs_mapping',
 }
 LAYERS = {f'aws_lambda_layer_version.dependency["{name}"]' for name in ('boto3', 'psycopg2')}
+QUEUES = {'aws_sqs_queue.cdc_events_q', 'aws_sqs_queue.cdc_events_q[0]'}
 
 
 def run(*args, cwd=None, capture=False):
@@ -160,6 +161,13 @@ def inputs():
         all(tfvars.get(key) == value for key, value in expected.items()),
         "Lambda inputs do not match this pipeline's account, region, function, role, or queue",
     )
+    queue_mode = tfvars.get('manage_queue', True)
+    expected_queue_mode = os.environ.get('EXPECTED_MANAGE_QUEUE', 'true')
+    require(
+        type(queue_mode) is bool and expected_queue_mode in ('true', 'false')
+        and queue_mode == (expected_queue_mode == 'true'),
+        'Queue ownership mode does not match the private pipeline permissions',
+    )
     require(tfvars.get('artifacts_directory') is None, 'Artifact path overrides are prohibited')
     shared_layers = tfvars.get('shared_layer_version_arns', {})
     validate_layer_pins(shared_layers)
@@ -213,7 +221,8 @@ def configuration(tfvars, backend):
 def guard_plan(plan, tfvars):
     """Allow updates and additions; require a separate migration for destructive changes."""
     allowed = (
-        CORE
+        (CORE - QUEUES)
+        | (QUEUES if tfvars.get('manage_queue', True) else set())
         | LAYERS
         | {
             'aws_iam_role_policy_attachment.lambda_vpc_policy_attachment',
@@ -356,7 +365,10 @@ def deploy(mode, source):
             return
         if os.environ.get('REQUIRE_EXISTING_STATE', 'true') == 'true':
             state = set(run(*tfcmd, 'state', 'list', cwd=WORK, capture=True).splitlines())
-            require(state >= CORE, 'Existing Lambda state is missing expected resources; verify the backend or import once')
+            require(
+                state >= CORE - QUEUES and (not tfvars.get('manage_queue', True) or bool(state & QUEUES)),
+                'Existing Lambda state is missing expected resources; verify the backend or import once',
+            )
         tests(WORK)
         package_lambda.build(WORK, tfvars.get('shared_layer_version_arns', {}))
         package_lambda.smoke(WORK, os.environ.get('LAMBDA_RUNTIME_IMAGE', package_lambda.RUNTIME_IMAGE))

@@ -14,6 +14,6 @@ output "dependency_layer_arns" {
 }
 
 output "queue_url" {
-  description = "URL of the managed CDC FIFO queue."
-  value       = aws_sqs_queue.cdc_events_q.url
+  description = "URL of the CDC FIFO queue, managed here or referenced from its owning stack."
+  value       = local.queue_url
 }
