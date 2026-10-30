@@ -1,79 +1,130 @@
-# Pinned shared dependency layers
+# Shared layers with runtime version inputs
 
-Normal Lambda deployments can use existing developer-owned boto3 and psycopg2
-layer versions. Keep the layer code and dependency requirements in this public
-repository; keep the actual account identifiers, version ARNs and backend inputs
-in the private infrastructure repository and Parameter Store.
+The public Lambda Terraform accepts exact layer-version ARNs. CodePipeline's
+Plan build resolves operational version choices into those ARNs. Layer version
+changes do not require editing Terraform or redeploying pipeline infrastructure.
+The Lambda still deploys through its normal plan, manual approval and apply.
 
-## Configure an environment
+## One-time setup
 
-Update the private pipeline `main.tf` from the matching handoff, then add this
-map to the environment's private `config/<environment>.tfvars.json`, preserving
-all its other settings:
+Install the matching public overlay and private pipeline `main.tf`. In the
+private environment `config/<environment>.tfvars.json`, preserve the existing
+settings and supply the approved shared layers and initial version defaults:
 
 ```json
 "shared_layer_version_arns": {
-  "boto3": "arn:aws:lambda:REGION:ACCOUNT_ID:layer:boto3-python313:VERSION",
-  "psycopg2": "arn:aws:lambda:REGION:ACCOUNT_ID:layer:psycopg2-python313:VERSION"
+  "boto3": "arn:aws:lambda:REGION:ACCOUNT_ID:layer:boto3-python313:2",
+  "psycopg2": "arn:aws:lambda:REGION:ACCOUNT_ID:layer:psycopg2-python313:2"
 }
 ```
 
-These are placeholders: use full version ARNs from the Lambda console, including
-the trailing positive version number. Both keys are required. The versions must
-be in this pipeline's account and Region and compatible with Python 3.13 and
-x86_64. Do not set `dependency_layer_names` overrides at the same time.
+Use real ARNs privately. Both keys are required in this account/Region, and
+`dependency_layer_names` overrides must be empty. This map establishes approved
+layer names and seeds defaults on first installation. After installation, do
+not edit its version suffixes to select releases; use the operational parameter
+below. All account, backend, networking and secret inputs stay private.
 
-The private pipeline derives its exact shared-layer read permissions and the
-build's expected ARNs from this JSON. There is no second list to maintain in
-`dev.tfvars` or `qa.tfvars`. Apply the private infrastructure to update Parameter
-Store and permissions, then start a NEW pipeline execution and review its plan.
-Keep each environment's own pipeline and application state keys.
+Apply the private pipeline infrastructure once with the correct environment's
+backend and tfvars. It creates the environment's SecureString parameter at
+`<ssm-prefix>/<environment>/terraform/layer-versions`, initially:
 
-The environment pipeline:
+```json
+{"boto3":"2","psycopg2":"2"}
+```
 
-1. Tests the application and builds only its function ZIP.
-2. Downloads the two exact layer ZIPs using authenticated Lambda API metadata.
-3. Verifies version identities, AWS-reported SHA256 hashes and package limits.
-4. Imports the actual downloaded layers with the function in the pinned Lambda
-   runtime container, without network access or AWS credentials in the container.
-5. Plans against the exact configured layer versions, waits for manual approval,
-   and applies the saved plan and sealed artifacts.
+Terraform owns that parameter's name, encryption and lifecycle. Operators own
+its value after creation: `ignore_changes = [value]` prevents later pipeline
+Terraform applies from resetting release choices to the bootstrap values.
+Get the exact parameter name from `terraform output -raw layer_versions_parameter_name`.
 
-Apply does not rebuild or download packages. The environment pipeline has no
-permission to publish or delete shared layer versions. It retains read access
-to its former function-specific layers so Terraform can refresh/migrate state.
+## Persistent version changes
 
-Omitting the map or setting it to `{}` preserves the original behavior: build
-and manage two function-specific layers. PR validation remains AWS-free and
-builds dependency ZIPs from the hash-locked requirements files.
+Keep a private release-selection file, for example
+`config/dev.layer-versions.json`, with the desired defaults:
 
-## Existing function-specific layer state
+```json
+{"boto3":"3","psycopg2":"2"}
+```
 
-If the Lambda state already manages function-specific dependency layers,
-switching to shared versions removes those two records from the environment's
-state. The supplied layers have `skip_destroy = true`: the pinned AWS provider
-retains their actual versions. The plan guard allows only this narrowly checked
-retirement of the environment's own retained layer records; it still rejects
-Lambda replacement, queue destruction and deletion of unrelated resources.
+Update the operational Parameter Store value, then start the pipeline or let
+the next source-code push start it:
 
-A Terraform plan can label these two retained records as deletions even though
-the provider does not delete their AWS versions. Confirm their names are the
-old function-specific layer names and `skip_destroy` is true. If older state
-has `skip_destroy = false`, migrate it separately; the pipeline will stop.
-Existing shared versions are data lookups and are never imported into every
-environment's state. See the [pinned provider retention implementation](https://github.com/hashicorp/terraform-provider-aws/blob/v6.65.0/internal/service/lambda/layer_version.go#L271-L288).
+```bash
+aws ssm put-parameter \
+  --name /searchlight/dev/terraform/layer-versions \
+  --type SecureString --overwrite \
+  --value file://config/dev.layer-versions.json \
+  --region YOUR_REGION --profile YOUR_WORK_PROFILE
 
-## Publishing a future shared version
+aws codepipeline start-pipeline-execution \
+  --name YOUR_DEV_PIPELINE \
+  --region YOUR_REGION --profile YOUR_WORK_PROFILE
+```
 
-The separate `terraform/shared-layers/` root is for the single shared-layer
-owner. It is NOT called by ordinary environment deployments. Its backend must
-use its own state key, separate from Lambda and pipeline states. Do not point
-that root at a Lambda application's existing state or a SAM/CloudFormation
-stack's resources.
+Use the output parameter name if your prefix differs. If the private pipeline
+uses a customer-managed Parameter Store key, also pass its matching `--key-id`
+to `put-parameter`; do not change the encryption key during a version update.
+Version values can be positive integers/digit strings or `latest`. Keep explicit
+numbers when you want reproducible defaults. No Terraform commands are needed
+for these routine version changes.
 
-For an intentional dependency release, the owner updates the hash-locked files
-under `requirements-layers/`, builds the packages using the existing helper,
-then reviews and applies the publisher root with private inputs:
+## One-execution overrides
+
+The CodePipeline variables `Boto3LayerVersion` and `Psycopg2LayerVersion` default
+to `configured`, meaning the Parameter Store defaults loaded by the Plan build.
+When starting a manual execution, either input can instead be a positive version
+number or `latest`:
+
+```bash
+aws codepipeline start-pipeline-execution \
+  --name YOUR_DEV_PIPELINE \
+  --variables name=Boto3LayerVersion,value=3 name=Psycopg2LayerVersion,value=2 \
+  --region YOUR_REGION --profile YOUR_WORK_PROFILE
+```
+
+These overrides affect only that execution. They do not persist as defaults for
+future automatic deployments. Update Parameter Store to make a selection stick.
+New layer versions must already be published; this workflow consumes them.
+
+`latest` means the highest currently published version for the approved layer
+name. The Plan build resolves it once, then verifies compatibility and package
+contents. An incompatible latest version fails; the build does not silently
+fall back to an older version. A new publication during approval cannot change
+the version in the approved plan.
+
+## Approval and permissions
+
+The existing helpers download and hash-verify the exact resolved layer ZIPs,
+smoke-import them with the function in the pinned Python 3.13/x86_64 runtime,
+and save a Terraform plan. The existing configuration artifact records the
+resolved pins, approved names and one-run overrides, and is checksum-bound to
+the code, packages, source revision and execution.
+
+Apply verifies the seal first and uses the approved concrete pins. It never
+reads mutable version defaults, resolves latest, downloads/rebuilds packages or
+replans. Later default-version edits affect new Plan builds, not an already
+approved release. Unrelated Lambda/backend inputs, allowed layer names, source,
+execution or approval artifacts still cannot change after planning.
+
+Layer ZIP reads are scoped to versions of the two approved names. Only Plan can
+read the operational defaults or call `ListLayerVersions`. AWS requires a
+wildcard resource for that metadata-list operation, so it is restricted to the
+pipeline Region. Shared-mode environment jobs cannot publish or delete layers.
+See the [AWS IAM action reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_lambda.html).
+
+## Migration and future publishing
+
+Keep the existing Lambda/application state and each environment's separate
+pipeline state. Old function-specific layer records may be retired only when
+`skip_destroy=true` and names/ARNs match this function; the pinned provider
+retains their physical versions. The guard still rejects Lambda replacement,
+queue destruction and unrelated removals. Existing shared versions are readonly
+lookups and are never owned by every environment state.
+
+The optional `terraform/shared-layers/` root remains a separate owner-controlled
+publisher for future dependency releases. It is not run by normal environment
+pipelines. Keep its backend inputs private and its state key separate. To build
+and publish intentionally:
 
 ```bash
 python scripts/package_lambda.py --smoke
@@ -83,14 +134,5 @@ terraform -chdir=terraform/shared-layers apply /PRIVATE/PATH/layers.tfplan
 terraform -chdir=terraform/shared-layers output -json shared_layer_version_arns
 ```
 
-The publisher creates new immutable versions and retains previous versions.
-It does not take over the existing shared version numbers merely because their
-layer names match. Ensure one publishing workflow owns future releases.
-
-Promote the returned version ARNs by selecting them in private Dev inputs first,
-then QA and production after testing. Publishing a version or changing a
-requirements file does not automatically advance other environments' pinned
-versions. No environment resolves "latest".
-
-The migration to already-published shared versions does not require this
-publisher root, a new layer pipeline, or application business-logic changes.
+Omitting `shared_layer_version_arns` keeps the original dedicated-layer mode.
+PR checks remain AWS-free. No Lambda business-logic changes are required.

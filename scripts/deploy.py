@@ -64,6 +64,85 @@ def install_terraform():
     return str(target / 'terraform')
 
 
+def approved_layer_bases():
+    """Keep approved layer names stable while selecting versions at release time."""
+    raw = os.environ.get('ALLOWED_SHARED_LAYER_ARNS')
+    if raw is None:
+        return None  # Compatibility with the earlier exact-version pipeline.
+    bases = json.loads(raw)
+    pattern = rf'arn:aws:lambda:{re.escape(os.environ["AWS_DEFAULT_REGION"])}:{os.environ["EXPECTED_ACCOUNT_ID"]}:layer:[A-Za-z0-9_-]+'
+    require(
+        isinstance(bases, dict)
+        and (not bases or set(bases) == {'boto3', 'psycopg2'})
+        and all(isinstance(arn, str) and re.fullmatch(pattern, arn) for arn in bases.values()),
+        'The private pipeline must approve both shared layer names in this account and Region',
+    )
+    return bases
+
+
+def validate_layer_pins(layers):
+    require(isinstance(layers, dict), 'Shared layer version ARNs must be a JSON object')
+    pattern = rf'arn:aws:lambda:{re.escape(os.environ["AWS_DEFAULT_REGION"])}:{os.environ["EXPECTED_ACCOUNT_ID"]}:layer:[A-Za-z0-9_-]+:[1-9][0-9]*'
+    require(
+        not layers or (
+            set(layers) == {'boto3', 'psycopg2'}
+            and all(isinstance(arn, str) and re.fullmatch(pattern, arn) for arn in layers.values())
+        ),
+        'Pin both shared layers to numbered version ARNs in this pipeline account and Region',
+    )
+    bases = approved_layer_bases()
+    approved = (
+        layers == json.loads(os.environ.get('EXPECTED_SHARED_LAYER_VERSION_ARNS', '{}'))
+        if bases is None else {name: arn.rsplit(':', 1)[0] for name, arn in layers.items()} == bases
+    )
+    require(approved, 'Shared layer versions do not match the private pipeline permissions')
+
+
+def layer_overrides():
+    return {name: os.environ.get(f'{name.upper()}_LAYER_VERSION', 'configured') for name in ('boto3', 'psycopg2')}
+
+
+def latest_layer_version(base):
+    result = json.loads(run('aws', 'lambda', 'list-layer-versions', '--layer-name', base, '--output', 'json', capture=True))
+    versions = result.get('LayerVersions') if isinstance(result, dict) else None
+    require(isinstance(versions, list) and versions, 'No published version is available for the approved shared layer')
+    require(
+        all(
+            isinstance(item, dict) and type(item.get('Version')) is int and item['Version'] > 0
+            and item.get('LayerVersionArn') == f'{base}:{item["Version"]}'
+            for item in versions
+        ),
+        'AWS returned an invalid version for the approved shared layer',
+    )
+    return str(max(item['Version'] for item in versions))
+
+
+def resolve_layer_versions(tfvars):
+    """Resolve defaults/one-run overrides once, before building or planning."""
+    bases = approved_layer_bases()
+    overrides = layer_overrides()
+    require(
+        all(isinstance(value, str) and re.fullmatch(r'configured|latest|[1-9][0-9]*', value) for value in overrides.values()),
+        'Layer version overrides must be configured, latest, or a positive version number',
+    )
+    if not bases:
+        require(all(value == 'configured' for value in overrides.values()), 'Runtime layer selection requires the updated shared-layer pipeline')
+        return tfvars
+    defaults = json.loads(os.environ.pop('LAYER_VERSIONS_JSON'))
+    require(isinstance(defaults, dict) and set(defaults) == {'boto3', 'psycopg2'}, 'Layer version defaults must select both dependencies')
+    defaults = {name: str(value) if type(value) is int else value for name, value in defaults.items()}
+    require(
+        all(isinstance(value, str) and re.fullmatch(r'latest|[1-9][0-9]*', value) for value in defaults.values()),
+        'Layer version defaults must select both dependencies using positive numbers or latest',
+    )
+    resolved = {}
+    for name, base in bases.items():
+        selected = defaults[name] if overrides[name] == 'configured' else overrides[name]
+        resolved[name] = f'{base}:{latest_layer_version(base) if selected == "latest" else selected}'
+    validate_layer_pins(resolved)
+    return tfvars | {'shared_layer_version_arns': resolved}
+
+
 def inputs():
     """Validate SSM documents against private pipeline settings without logging their contents."""
     tfvars = json.loads(os.environ.pop('TFVARS_JSON'))
@@ -83,18 +162,7 @@ def inputs():
     )
     require(tfvars.get('artifacts_directory') is None, 'Artifact path overrides are prohibited')
     shared_layers = tfvars.get('shared_layer_version_arns', {})
-    require(isinstance(shared_layers, dict), 'Shared layer version ARNs must be a JSON object')
-    if shared_layers:
-        pattern = rf'arn:aws:lambda:{re.escape(expected["region"])}:{expected["allowed_account_id"]}:layer:[A-Za-z0-9_-]+:[1-9][0-9]*'
-        require(
-            set(shared_layers) == {'boto3', 'psycopg2'}
-            and all(isinstance(arn, str) and re.fullmatch(pattern, arn) for arn in shared_layers.values()),
-            'Pin both shared layers to numbered version ARNs in this pipeline account and Region',
-        )
-    require(
-        shared_layers == json.loads(os.environ.get('EXPECTED_SHARED_LAYER_VERSION_ARNS', '{}')),
-        'Shared layer versions do not match the private pipeline permissions',
-    )
+    validate_layer_pins(shared_layers)
     names = {name: f'{expected["function_name"]}-{name}' for name in ('boto3', 'psycopg2')}
     layer_names = tfvars.get('dependency_layer_names', {})
     require(
@@ -136,6 +204,9 @@ def configuration(tfvars, backend):
         'source_sha': os.environ['SOURCE_SHA'],
         'execution_id': os.environ['EXECUTION_ID'],
         'environment': os.environ['ENVIRONMENT'],
+        'shared_layer_version_arns': tfvars.get('shared_layer_version_arns', {}),
+        'allowed_shared_layer_arns': approved_layer_bases(),
+        'layer_overrides': layer_overrides(),
     }
 
 
@@ -249,13 +320,21 @@ def deploy(mode, source):
     require(account == os.environ['EXPECTED_ACCOUNT_ID'], 'Wrong AWS account')
     require(not any((source / 'terraform').rglob('*.tfvars*')), 'Do not commit Terraform environment inputs')
     require(not any((source / 'terraform').rglob('*.tf.json')), 'Use sealed .tf files rather than .tf.json configuration')
-    tfvars, backend = inputs()
     if mode == 'apply':
         verify(source)
+    tfvars, backend = inputs()
+    if mode == 'apply':
+        saved = json.loads((source / 'dist/plan/configuration.sha256').read_text())
+        approved_layers = saved.get('shared_layer_version_arns', {})
+        validate_layer_pins(approved_layers)
+        if approved_layers or 'shared_layer_version_arns' in tfvars:
+            tfvars = tfvars | {'shared_layer_version_arns': approved_layers}
         require(
-            json.loads((source / 'dist/plan/configuration.sha256').read_text()) == configuration(tfvars, backend),
+            saved == configuration(tfvars, backend),
             'Environment inputs or release identity changed after approval; create a new plan',
         )
+    else:
+        tfvars = resolve_layer_versions(tfvars)
     require(not WORK.exists(), f'Use a fresh build container; release directory already exists: {WORK}')
     shutil.copytree(source, WORK, ignore=shutil.ignore_patterns('.git', '.terraform', '__pycache__', '.env*'))
     with tempfile.TemporaryDirectory(prefix='searchlight-config-') as config:

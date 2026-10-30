@@ -17,7 +17,7 @@ PR checks run without AWS credentials. The trusted environment branch starts the
 4. Review the linked Terraform plan in the private artifact bucket and approve it in CodePipeline.
 5. The Apply project verifies the approved artifacts and current configuration, then runs `scripts/deploy.py apply`. It applies the saved plan with the already-built ZIPs. It does not rebuild or replan.
 
-Changing inputs after planning requires a fresh plan and approval. Destruction or replacement of the existing function, runtime role, queue or mapping requires a separate reviewed migration. Dedicated dependency layers publish new immutable versions and retain the previous versions. Shared consumers use only the exact configured versions and cannot publish or delete shared layers.
+Changing Lambda/backend inputs after planning requires a fresh plan and approval. Operational layer-version defaults are resolved only in Plan; edits after planning affect subsequent runs while the approved concrete layer pins remain unchanged. Destruction or replacement of the existing function, runtime role, queue or mapping requires a separate reviewed migration. Dedicated dependency layers publish new immutable versions and retain the previous versions. Shared consumers use only the exact configured versions and cannot publish or delete shared layers.
 
 ## Configuration and existing resources
 

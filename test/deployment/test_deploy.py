@@ -1,6 +1,7 @@
 """Approval must bind the package, Terraform, source revision and private inputs."""
 
 # ruff: noqa: CPY001, PT009, PT027
+import hashlib
 import json
 import os
 import sys
@@ -44,6 +45,7 @@ BACKEND = {
     'use_lockfile': True,
 }
 SHARED = {name: f'arn:aws:lambda:us-east-1:123456789012:layer:shared-{name}:2' for name in ('boto3', 'psycopg2')}
+BASES = {name: arn.rsplit(':', 1)[0] for name, arn in SHARED.items()}
 
 
 class DeploymentTests(unittest.TestCase):
@@ -120,6 +122,98 @@ class DeploymentTests(unittest.TestCase):
             self.assertNotEqual(seal, deploy.configuration(TFVARS | {'timeout': 60}, BACKEND))
             os.environ['EXECUTION_ID'] = 'another-execution'
             self.assertNotEqual(seal, deploy.configuration(TFVARS, BACKEND))
+
+    def runtime_env(self, defaults=None, **overrides):
+        return ENV | {
+            'ALLOWED_SHARED_LAYER_ARNS': json.dumps(BASES),
+            'LAYER_VERSIONS_JSON': json.dumps({'boto3': '2', 'psycopg2': '2'} if defaults is None else defaults),
+        } | overrides
+
+    def test_runtime_layer_scope_allows_new_versions_but_not_new_names(self):
+        configured = TFVARS | {'shared_layer_version_arns': {name: f'{base}:7' for name, base in BASES.items()}}
+        self.assertEqual(self.load(configured, extra=self.runtime_env())[0], configured)
+        for bases in (
+            None, [], {'boto3': BASES['boto3']}, BASES | {'other': BASES['boto3']},
+            BASES | {'boto3': BASES['boto3'] + ':*'},
+            BASES | {'boto3': BASES['boto3'].replace('123456789012', '999999999999')},
+            BASES | {'boto3': BASES['boto3'].replace('us-east-1', 'us-west-2')},
+            BASES | {'boto3': BASES['boto3'].replace('shared-boto3', 'another-boto3')},
+        ):
+            with self.subTest(bases=bases), self.assertRaises(ValueError):
+                self.load(configured, extra={'ALLOWED_SHARED_LAYER_ARNS': json.dumps(bases)})
+
+    def test_persistent_defaults_and_one_run_overrides_resolve_without_aws_listing(self):
+        template = TFVARS | {'shared_layer_version_arns': SHARED}
+        with patch.dict(os.environ, self.runtime_env({'boto3': '3', 'psycopg2': '2'}), clear=True), patch.object(deploy, 'run') as aws:
+            resolved = deploy.resolve_layer_versions(template)
+            self.assertEqual(resolved['shared_layer_version_arns'], {'boto3': BASES['boto3'] + ':3', 'psycopg2': SHARED['psycopg2']})
+            aws.assert_not_called()
+        self.assertEqual(template['shared_layer_version_arns'], SHARED)
+        with (
+            patch.dict(os.environ, self.runtime_env({'boto3': '3', 'psycopg2': '2'}, BOTO3_LAYER_VERSION='4'), clear=True),
+            patch.object(deploy, 'run') as aws,
+        ):
+            resolved = deploy.resolve_layer_versions(template)
+            self.assertEqual(resolved['shared_layer_version_arns']['boto3'], BASES['boto3'] + ':4')
+            aws.assert_not_called()
+        with patch.dict(os.environ, self.runtime_env({'boto3': 3, 'psycopg2': 2}), clear=True), patch.object(deploy, 'run') as aws:
+            resolved = deploy.resolve_layer_versions(template)
+            self.assertEqual(resolved['shared_layer_version_arns']['boto3'], BASES['boto3'] + ':3')
+            aws.assert_not_called()
+
+    def test_latest_resolves_highest_number_only_for_the_approved_name(self):
+        versions = [{'Version': number, 'LayerVersionArn': f'{BASES["boto3"]}:{number}'} for number in (1, 8, 3)]
+        with (
+            patch.dict(os.environ, self.runtime_env(BOTO3_LAYER_VERSION='latest'), clear=True),
+            patch.object(deploy, 'run', return_value=json.dumps({'LayerVersions': versions})) as aws,
+        ):
+            resolved = deploy.resolve_layer_versions(TFVARS | {'shared_layer_version_arns': SHARED})
+            self.assertEqual(resolved['shared_layer_version_arns']['boto3'], BASES['boto3'] + ':8')
+            self.assertEqual(resolved['shared_layer_version_arns']['psycopg2'], SHARED['psycopg2'])
+            aws.assert_called_once_with('aws', 'lambda', 'list-layer-versions', '--layer-name', BASES['boto3'], '--output', 'json', capture=True)
+
+    def test_invalid_runtime_defaults_and_overrides_are_rejected(self):
+        for defaults in (None, [], {}, {'boto3': '2'}, {'boto3': '2', 'psycopg2': '2', 'other': '2'},
+                         {'boto3': True, 'psycopg2': '2'}, {'boto3': 2.0, 'psycopg2': '2'},
+                         {'boto3': 0, 'psycopg2': '2'}, {'boto3': -2, 'psycopg2': '2'}, {'boto3': '0', 'psycopg2': '2'},
+                         {'boto3': '02', 'psycopg2': '2'}, {'boto3': 'configured', 'psycopg2': '2'},
+                         {'boto3': 'LATEST', 'psycopg2': '2'}):
+            env = self.runtime_env() | {'LAYER_VERSIONS_JSON': json.dumps(defaults)}
+            with self.subTest(defaults=defaults), patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
+                deploy.resolve_layer_versions(TFVARS | {'shared_layer_version_arns': SHARED})
+        for override in ('', '0', '01', '-1', 'Latest', ':2', '*', '2; echo nope'):
+            with (
+                self.subTest(override=override),
+                patch.dict(os.environ, self.runtime_env(BOTO3_LAYER_VERSION=override), clear=True),
+                self.assertRaises(ValueError),
+            ):
+                deploy.resolve_layer_versions(TFVARS | {'shared_layer_version_arns': SHARED})
+        with (
+            patch.dict(os.environ, ENV | {'BOTO3_LAYER_VERSION': '3'}, clear=True),
+            self.assertRaisesRegex(ValueError, 'updated shared-layer pipeline'),
+        ):
+            deploy.resolve_layer_versions(TFVARS)
+
+    def test_latest_rejects_empty_foreign_or_malformed_aws_versions(self):
+        for versions in (None, [], {}, [{'Version': 3}], [{'Version': '3', 'LayerVersionArn': BASES['boto3'] + ':3'}],
+                         [{'Version': True, 'LayerVersionArn': BASES['boto3'] + ':1'}],
+                         [{'Version': 0, 'LayerVersionArn': BASES['boto3'] + ':0'}],
+                         [{'Version': 3, 'LayerVersionArn': BASES['psycopg2'] + ':3'}]):
+            with (
+                self.subTest(versions=versions),
+                patch.object(deploy, 'run', return_value=json.dumps({'LayerVersions': versions})),
+                self.assertRaises(ValueError),
+            ):
+                deploy.latest_layer_version(BASES['boto3'])
+
+    def test_dedicated_and_static_pipeline_modes_remain_compatible(self):
+        with patch.dict(os.environ, ENV, clear=True), patch.object(deploy, 'run') as aws:
+            self.assertEqual(deploy.resolve_layer_versions(TFVARS), TFVARS)
+            configured = TFVARS | {'shared_layer_version_arns': SHARED}
+            self.assertEqual(deploy.resolve_layer_versions(configured), configured)
+            aws.assert_not_called()
+        with patch.dict(os.environ, self.runtime_env() | {'ALLOWED_SHARED_LAYER_ARNS': '{}'}, clear=True):
+            self.assertEqual(deploy.resolve_layer_versions(TFVARS), TFVARS)
 
     def test_plan_accepts_lambda_updates_and_retained_layer_replacements(self):
         changes = [
@@ -314,6 +408,163 @@ class DeploymentTests(unittest.TestCase):
                 download.assert_not_called()
                 smoke.assert_not_called()
                 tests.assert_not_called()
+
+    def test_plan_to_apply_freezes_latest_despite_new_publications_and_default_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'source'
+            self.fixture(root)
+            template = TFVARS | {'shared_layer_version_arns': SHARED}
+            selected = SHARED | {'boto3': BASES['boto3'] + ':8'}
+            effective = template | {'shared_layer_version_arns': selected}
+            env = self.runtime_env({'boto3': 'latest', 'psycopg2': '2'}) | {
+                'TFVARS_JSON': json.dumps(template), 'BACKEND_JSON': json.dumps(BACKEND),
+                'CODEBUILD_RESOLVED_SOURCE_VERSION': ENV['SOURCE_SHA'],
+                'ARTIFACT_BUCKET': 'example-artifacts', 'ARTIFACT_KMS_KEY': 'example-key',
+            }
+            plan_work = Path(directory) / 'plan-work'
+            commands = []
+
+            def fake_tests(work):
+                (work / 'dist/unit-results.xml').write_text('<testsuite/>')
+
+            def fake_plan_run(*args, **kwargs):
+                commands.append(args)
+                if args[:2] == ('aws', 'sts'):
+                    return ENV['EXPECTED_ACCOUNT_ID']
+                if args[:3] == ('aws', 'lambda', 'list-layer-versions'):
+                    return json.dumps({'LayerVersions': [{'Version': 8, 'LayerVersionArn': selected['boto3']}]})
+                if args[0] == 'pinned-terraform':
+                    if args[2] == 'plan':
+                        (plan_work / 'dist/plan/approved.tfplan').write_bytes(b'approved binary plan')
+                    return {
+                        ('state', 'list'): '\n'.join(deploy.CORE),
+                        ('show', '-json'): json.dumps({'resource_changes': [{
+                            'address': 'aws_lambda_function.cdc_handler',
+                            'change': {'actions': ['update'], 'after': {'layers': [selected['boto3'], selected['psycopg2']]}},
+                        }]}),
+                        ('show', '-no-color'): 'Plan: 0 to add, 1 to change, 0 to destroy.\n',
+                    }.get(args[2:4], '')
+                return ''
+
+            with (
+                patch.dict(os.environ, env, clear=True),
+                patch.object(deploy, 'WORK', plan_work),
+                patch.object(deploy, 'run', fake_plan_run),
+                patch.object(deploy, 'install_terraform', return_value='pinned-terraform'),
+                patch.object(deploy, 'tests', side_effect=fake_tests),
+                patch.object(deploy.package_lambda, 'build') as build,
+                patch.object(deploy.package_lambda, 'smoke'),
+            ):
+                deploy.deploy('plan', root)
+                build.assert_called_once_with(plan_work, selected)
+                self.assertEqual(json.loads((root / 'dist/plan/configuration.sha256').read_text()), deploy.configuration(effective, BACKEND))
+            self.assertEqual(sum(args[:3] == ('aws', 'lambda', 'list-layer-versions') for args in commands), 1)
+            checksum = hashlib.sha256((root / 'dist/plan/checksums.sha256').read_bytes()).hexdigest()
+            apply_commands = []
+
+            def fake_apply_run(*args, **kwargs):
+                apply_commands.append(args)
+                if args[:2] == ('aws', 'sts'):
+                    return ENV['EXPECTED_ACCOUNT_ID']
+                self.assertEqual(args[0], 'pinned-terraform')
+                self.assertIn(args[2], ('init', 'apply'))
+                if args[2] == 'init':
+                    config = Path(args[-1].split('=', 1)[1]).parent
+                    self.assertEqual(json.loads((config / 'tfvars.json').read_text()), effective)
+                return ''
+
+            # Apply has neither a fresh layer-default read nor a latest lookup.
+            apply_env = env | {'LAYER_VERSIONS_JSON': 'defaults changed after approval', 'APPROVED_CHECKSUM_SHA256': checksum}
+            with (
+                patch.dict(os.environ, apply_env, clear=True),
+                patch.object(deploy, 'WORK', Path(directory) / 'apply-work'),
+                patch.object(deploy, 'run', fake_apply_run),
+                patch.object(deploy, 'install_terraform', return_value='pinned-terraform'),
+                patch.object(deploy, 'resolve_layer_versions') as resolve,
+                patch.object(deploy.package_lambda, 'build') as build,
+                patch.object(deploy.package_lambda, 'shared_layer') as download,
+                patch.object(deploy.package_lambda, 'smoke') as smoke,
+                patch.object(deploy, 'tests') as tests,
+            ):
+                deploy.deploy('apply', root)
+                resolve.assert_not_called()
+                build.assert_not_called()
+                download.assert_not_called()
+                smoke.assert_not_called()
+                tests.assert_not_called()
+            self.assertEqual([args[2] for args in apply_commands if args[0] == 'pinned-terraform'], ['init', 'apply'])
+            self.assertEqual(apply_commands[-1][-1], '../dist/plan/approved.tfplan')
+
+    def test_apply_rejects_changed_scope_mode_other_inputs_and_one_run_overrides(self):
+        configured = TFVARS | {'shared_layer_version_arns': SHARED}
+        other_layers = {name: arn.replace('shared-', 'other-') for name, arn in SHARED.items()}
+        other_bases = {name: arn.replace('shared-', 'other-') for name, arn in BASES.items()}
+        changes = (
+            {'TFVARS_JSON': json.dumps(configured | {'timeout': 60})},
+            {
+                'TFVARS_JSON': json.dumps(configured | {'shared_layer_version_arns': other_layers}),
+                'ALLOWED_SHARED_LAYER_ARNS': json.dumps(other_bases),
+            },
+            {'ALLOWED_SHARED_LAYER_ARNS': None, 'EXPECTED_SHARED_LAYER_VERSION_ARNS': json.dumps(SHARED)},
+            {'BOTO3_LAYER_VERSION': '3'},
+            {'BACKEND_JSON': json.dumps(BACKEND | {'key': 'other.tfstate'})},
+            {'SOURCE_SHA': 'b' * 40},
+        )
+        for change in changes:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / 'source'
+                self.fixture(root)
+                env = self.runtime_env() | {'TFVARS_JSON': json.dumps(configured), 'BACKEND_JSON': json.dumps(BACKEND)}
+                with patch.dict(os.environ, env, clear=True):
+                    (root / 'dist/plan/configuration.sha256').write_bytes(deploy.canonical(deploy.configuration(configured, BACKEND)))
+                    checksum = deploy.seal(root)
+                updated = env | {'APPROVED_CHECKSUM_SHA256': checksum} | {name: value for name, value in change.items() if value is not None}
+                for name, value in change.items():
+                    if value is None:
+                        updated.pop(name, None)
+                with (
+                    patch.dict(os.environ, updated, clear=True),
+                    patch.object(deploy, 'run', return_value=ENV['EXPECTED_ACCOUNT_ID']),
+                    patch.object(deploy, 'install_terraform') as terraform,
+                    self.assertRaises(ValueError),
+                ):
+                    deploy.deploy('apply', root)
+                terraform.assert_not_called()
+
+    def test_saved_selection_cannot_expand_legacy_exact_version_permission(self):
+        configured = TFVARS | {'shared_layer_version_arns': SHARED}
+        selected = configured | {'shared_layer_version_arns': SHARED | {'boto3': BASES['boto3'] + ':3'}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'source'
+            self.fixture(root)
+            env = ENV | {'TFVARS_JSON': json.dumps(configured), 'BACKEND_JSON': json.dumps(BACKEND),
+                         'EXPECTED_SHARED_LAYER_VERSION_ARNS': json.dumps(SHARED)}
+            with patch.dict(os.environ, env, clear=True):
+                (root / 'dist/plan/configuration.sha256').write_bytes(deploy.canonical(deploy.configuration(selected, BACKEND)))
+                env['APPROVED_CHECKSUM_SHA256'] = deploy.seal(root)
+            with (
+                patch.dict(os.environ, env, clear=True),
+                patch.object(deploy, 'run', return_value=ENV['EXPECTED_ACCOUNT_ID']),
+                patch.object(deploy, 'install_terraform') as terraform,
+                self.assertRaisesRegex(ValueError, 'private pipeline permissions'),
+            ):
+                deploy.deploy('apply', root)
+            terraform.assert_not_called()
+
+    def test_apply_verifies_selection_artifact_before_reading_current_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            checksum = deploy.seal(root)
+            (root / 'dist/plan/configuration.sha256').write_text('{"shared_layer_version_arns": "tampered"}')
+            with (
+                patch.dict(os.environ, ENV | {'APPROVED_CHECKSUM_SHA256': checksum}, clear=True),
+                patch.object(deploy, 'run', return_value=ENV['EXPECTED_ACCOUNT_ID']),
+                patch.object(deploy, 'inputs') as inputs,
+                self.assertRaises(ValueError),
+            ):
+                deploy.deploy('apply', root)
+            inputs.assert_not_called()
 
 
 if __name__ == '__main__':
