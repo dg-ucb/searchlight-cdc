@@ -270,6 +270,23 @@ class DeploymentTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 deploy.guard_plan({'resource_changes': [invalid]}, configured)
 
+    def test_shared_lambda_creation_accepts_fully_known_terraform_list_masks(self):
+        configured = TFVARS | {'shared_layer_version_arns': SHARED}
+        change = {
+            'actions': ['create'],
+            'before': None,
+            'after': {'layers': [SHARED['boto3'], SHARED['psycopg2']]},
+            'after_unknown': {'arn': True, 'id': True, 'layers': [False, False], 'role': True},
+        }
+        resource = {'address': 'aws_lambda_function.cdc_handler', 'change': change}
+        for actions in (['create'], ['update'], ['no-op']):
+            for unknown in ({}, {'layers': False}, {'layers': [False, False]}):
+                known = change | {'actions': actions, 'after_unknown': unknown}
+                with self.subTest(actions=actions, unknown=unknown):
+                    deploy.guard_plan({'resource_changes': [resource | {'change': known}]}, configured)
+        with self.assertRaisesRegex(ValueError, 'Destruction/replacement'):
+            deploy.guard_plan({'resource_changes': [resource | {'change': change | {'actions': ['delete', 'create']}}]}, configured)
+
     def test_shared_lambda_plan_cannot_select_other_or_unknown_layer_versions(self):
         configured = TFVARS | {'shared_layer_version_arns': SHARED}
         change = {'actions': ['update'], 'after': {'layers': [SHARED['boto3'], SHARED['psycopg2']]}}
@@ -277,8 +294,14 @@ class DeploymentTests(unittest.TestCase):
         deploy.guard_plan({'resource_changes': [resource]}, configured)
         for invalid in (
             change | {'after': {'layers': [SHARED['boto3']]}},
-            change | {'after': {'layers': [SHARED['boto3'].removesuffix(':2') + ':3', SHARED['psycopg2']]}},
-            change | {'after_unknown': {'layers': True}},
+            change | {'after': {'layers': [SHARED['psycopg2'], SHARED['boto3']]}, 'after_unknown': {'layers': [False, False]}},
+            change | {'after': {'layers': [SHARED['boto3'].removesuffix(':2') + ':3', SHARED['psycopg2']]},
+                      'after_unknown': {'layers': [False, False]}},
+            *(change | {'after_unknown': {'layers': mask}} for mask in (
+                True, [False, True], [True, False], [True, True],
+                [[False, True], False], {'0': False, '1': True},
+                [], [False], [False, False, False], [0, 0], [None, None], None, 'false',
+            )),
             change | {'after': None},
         ):
             with self.subTest(change=invalid), self.assertRaisesRegex(ValueError, 'exact approved'):

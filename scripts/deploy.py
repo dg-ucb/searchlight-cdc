@@ -232,9 +232,15 @@ def guard_plan(plan, tfvars):
         address, change = resource['address'], resource['change']
         require(address in allowed, f'Unexpected managed resource in plan: {address}')
         if shared_layers and address == 'aws_lambda_function.cdc_handler':
+            unknown_layers = (change.get('after_unknown') or {}).get('layers', False)
+            # Terraform can represent a fully known list with per-element false flags.
+            known_layers = unknown_layers is False or (
+                isinstance(unknown_layers, list) and len(unknown_layers) == len(shared_layers)
+                and all(unknown is False for unknown in unknown_layers)
+            )
             require(
                 (change.get('after') or {}).get('layers') == [shared_layers[name] for name in ('boto3', 'psycopg2')]
-                and not (change.get('after_unknown') or {}).get('layers'),
+                and known_layers,
                 'The Lambda plan must attach the exact approved shared layer versions',
             )
         if shared_layers and address in LAYERS and change['actions'] != ['no-op']:
