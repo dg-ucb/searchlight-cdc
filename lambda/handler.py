@@ -59,10 +59,12 @@ class DirectTables:
     """Fully-qualified PostgreSQL table names for the direct schema."""
 
     schema: str
+    comments: str
+    comment_fts: str
     notes: str
     topics: str
     authors: str
-    fts: str
+    note_fts: str
     pending_topics: str
     cdc_log: str
     handler_version: str
@@ -73,10 +75,12 @@ def load_tables() -> DirectTables:
     schema = os.environ.get('RDS_SCHEMA_BOA_APP_RDS_DATA', 'boa_app_rds_data')
     return DirectTables(
         schema=schema,
+        comments=os.environ.get('COMMENTS_TABLE', f'{schema}.advising_appointment_comments'),
+        comment_fts=os.environ.get('APPT_COMMENT_FTS_TABLE', f'{schema}.appointment_comments_search_index'),
         notes=os.environ.get('NOTES_TABLE', f'{schema}.advising_notes'),
         topics=os.environ.get('TOPICS_TABLE', f'{schema}.advising_note_topics'),
         authors=os.environ.get('AUTHORS_TABLE', f'{schema}.advising_note_authors_index'),
-        fts=os.environ.get('FTS_TABLE', f'{schema}.advising_notes_search_index'),
+        note_fts=os.environ.get('FTS_TABLE', f'{schema}.advising_notes_search_index'),
         pending_topics=os.environ.get(
             'PENDING_TOPICS_TABLE',
             f'{schema}.advising_note_topics_pending',
@@ -115,6 +119,8 @@ def process_message(
             process_note(cur, operation, row, message_id)
         elif table == 'note_topics':
             process_note_topic(cur, operation, row, message_id)
+        elif table == 'comments':
+            process_comment(cur, operation, row, message_id)
         else:
             raise ValueError(f'Unsupported table: {table}')
 
@@ -166,6 +172,110 @@ def insert_cdc_log(  # noqa: PLR0913
     )
 
 
+def process_comment(
+    cur: psycopg2.extensions.cursor,
+    operation: str,
+    row: dict[str, Any],
+    event_id: str,
+) -> None:
+    """Upsert or delete a comment; writes CDC audit row in the same transaction."""
+    t = load_tables()
+
+    comment_id = str(row.get('id')) if row.get('id') is not None else None
+    if not comment_id:
+        raise ValueError("Comment row missing required 'id' field")
+    comment_parent_id = str(row.get('comment_parent_id')) if row.get('comment_parent_id') is not None else None
+    if not comment_parent_id:
+        raise ValueError("Comment row missing required 'comment_parent_id' field")
+    parent_type = str(row.get('parent_type')) if row.get('parent_type') is not None else None
+    if not parent_type:
+        raise ValueError("Comment row missing required 'parent_type' field")
+
+    composite_id = f'{parent_type}-comment-{comment_id}'
+
+    if is_delete_operation(operation, row):
+        cur.execute(f'DELETE FROM {t.comments} WHERE id = %s', (comment_id,))
+        insert_cdc_log(
+            cur,
+            t,
+            event_id=event_id,
+            table_name='comments',
+            operation=operation,
+            row=row,
+            prepared_record={'boa_id': comment_id, 'comment_parent_id': comment_parent_id, 'parent_type': parent_type},
+            composite_id=composite_id,
+            boa_id=comment_id,
+            apply_status='applied',
+        )
+        log(
+            SERVICE_NAME,
+            logging.INFO,
+            'Comment deleted',
+            event_id=event_id,
+            boa_id=comment_id,
+            parent_type=parent_type,
+        )
+        return
+
+    if operation in ('create', 'update', 'upsert'):
+        sql = f"""
+            INSERT INTO {t.comments} (
+                id, boa_id, author_uid, author_name, author_role,
+                author_dept_codes, body, created_at, updated_at
+            )
+            VALUES (
+                %(id)s, %(boa_id)s, %(author_uid)s, %(author_name)s, %(author_role)s,
+                %(author_dept_codes)s, %(body)s, %(created_at)s, %(updated_at)s
+            )
+            ON CONFLICT (boa_id)
+            DO UPDATE SET
+                id = EXCLUDED.id,
+                author_uid = EXCLUDED.author_uid,
+                author_name = EXCLUDED.author_name,
+                author_role = EXCLUDED.author_role,
+                author_dept_codes = EXCLUDED.author_dept_codes,
+                body = EXCLUDED.body,
+                created_at = EXCLUDED.created_at,
+                updated_at = EXCLUDED.updated_at
+        """
+        payload = {
+            'id': row.get('comment_parent_id'),
+            'boa_id': comment_id,
+            'author_uid': row.get('author_uid'),
+            'author_name': row.get('author_name'),
+            'author_role': row.get('author_role'),
+            'author_dept_codes': row.get('author_dept_codes'),
+            'body': row.get('body'),
+            'created_at': row.get('created_at'),
+            'updated_at': row.get('updated_at'),
+        }
+        cur.execute(sql, payload)
+        fts_status = update_comment_fts_index(cur, t, parent_type, comment_parent_id, comment_id, event_id)
+        insert_cdc_log(
+            cur,
+            t,
+            event_id=event_id,
+            table_name='comments',
+            operation=operation,
+            row=row,
+            prepared_record=payload,
+            composite_id=composite_id,
+            boa_id=comment_id,
+            apply_status='partial_warning' if fts_status == 'warning' else 'applied',
+        )
+        log(
+            SERVICE_NAME,
+            logging.INFO,
+            'Comment upserted',
+            event_id=event_id,
+            boa_id=comment_id,
+            parent_type=parent_type,
+        )
+        return
+
+    raise ValueError(f'Unsupported operation: {operation}')
+
+
 def process_note(
     cur: psycopg2.extensions.cursor,
     operation: str,
@@ -184,9 +294,17 @@ def process_note(
             )
 
         composite_id = f'boa-{sid}-{note_id}'
-        cur.execute(f'DELETE FROM {t.notes} WHERE id = %s', (composite_id,))
+        cur.execute(
+            f"""WITH deleted_ids AS (
+                DELETE FROM {t.notes} WHERE id = %s OR parent_note_id = %s
+                RETURNING id
+            )
+            DELETE FROM {t.note_fts} WHERE id IN (
+                SELECT id FROM deleted_ids
+            )""",
+            (composite_id, note_id),
+        )
         cur.execute(f'DELETE FROM {t.topics} WHERE id = %s', (composite_id,))
-        cur.execute(f'DELETE FROM {t.fts} WHERE id = %s', (composite_id,))
         cur.execute(f'DELETE FROM {t.pending_topics} WHERE boa_id = %s', (note_id,))
         insert_cdc_log(
             cur,
@@ -267,7 +385,7 @@ def process_note(
             note_id,
             event_id,
         )
-        fts_status = update_fts_index(cur, t, note_id, event_id)
+        fts_status = update_note_fts_index(cur, t, note_id, event_id)
         insert_cdc_log(
             cur,
             t,
@@ -378,7 +496,7 @@ def process_note_topic(
             f'DELETE FROM {t.topics} WHERE id = %s AND topic = %s',
             (composite_id, topic),
         )
-        fts_status = update_fts_index(cur, t, composite_id, event_id)
+        fts_status = update_note_fts_index(cur, t, composite_id, event_id)
         insert_cdc_log(
             cur,
             t,
@@ -412,7 +530,7 @@ def process_note_topic(
             """,
             (composite_id, sid, boa_id, topic),
         )
-        fts_status = update_fts_index(cur, t, composite_id, event_id)
+        fts_status = update_note_fts_index(cur, t, composite_id, event_id)
         insert_cdc_log(
             cur,
             t,
@@ -494,7 +612,11 @@ def update_authors_index(
         VALUES (%(advisor_name)s, %(advisor_uid)s)
         ON CONFLICT (advisor_name) DO UPDATE SET advisor_uid = EXCLUDED.advisor_uid
     """
-    cur.execute(sql, (advisor_name, advisor_uid))
+    params = {
+        'advisor_name': advisor_name,
+        'advisor_uid': advisor_uid,
+    }
+    cur.execute(sql, params)
     if cur.rowcount == 0:
         log(
             SERVICE_NAME,
@@ -514,7 +636,48 @@ def update_authors_index(
     return 'applied'
 
 
-def update_fts_index(
+def update_comment_fts_index(
+    cur: psycopg2.extensions.cursor,
+    t: Any,
+    parent_type: str,
+    comment_parent_id: str,
+    boa_id: str,
+    event_id: str,
+) -> str:
+    """Rebuild FTS for one row from advising_appointment_comments table. Returns applied or warning."""
+    sql = f"""
+        INSERT INTO {t.comment_fts} (id, boa_id, fts_index)
+        SELECT
+            id,
+            boa_id,
+            TO_TSVECTOR( 'english', COALESCE(body, '') || ' ' || author_name ) AS fts_index
+        FROM {t.comments}
+        WHERE id = %s AND boa_id = %s
+        ON CONFLICT (boa_id) DO UPDATE SET fts_index = EXCLUDED.fts_index
+    """
+    cur.execute(sql, (comment_parent_id, boa_id))
+    if cur.rowcount == 0:
+        log(
+            SERVICE_NAME,
+            logging.WARNING,
+            'Comments FTS index update resulted in no rows affected',
+            event_id=event_id,
+            boa_id=boa_id,
+            parent_type=parent_type,
+        )
+        return 'warning'
+    log(
+        SERVICE_NAME,
+        logging.INFO,
+        'Comments FTS index updated',
+        event_id=event_id,
+        boa_id=boa_id,
+        parent_type=parent_type,
+    )
+    return 'applied'
+
+
+def update_note_fts_index(
     cur: psycopg2.extensions.cursor,
     t: Any,
     composite_id: str,
@@ -546,7 +709,7 @@ def update_fts_index(
             FROM note_data nd
             LEFT JOIN topic_agg ta ON nd.id = ta.id
         )
-        INSERT INTO {t.fts} (id, fts_index)
+        INSERT INTO {t.note_fts} (id, fts_index)
         SELECT id, fts_index FROM fts_content
         WHERE id IS NOT NULL
         ON CONFLICT (id) DO UPDATE SET fts_index = EXCLUDED.fts_index
@@ -556,7 +719,7 @@ def update_fts_index(
         log(
             SERVICE_NAME,
             logging.WARNING,
-            'FTS index update resulted in no rows affected',
+            'Notes FTS index update resulted in no rows affected',
             event_id=event_id,
             composite_id=composite_id,
         )
@@ -564,7 +727,7 @@ def update_fts_index(
     log(
         SERVICE_NAME,
         logging.INFO,
-        'FTS index updated',
+        'Notes FTS index updated',
         event_id=event_id,
         composite_id=composite_id,
     )

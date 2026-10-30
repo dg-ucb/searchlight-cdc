@@ -64,6 +64,8 @@ Passthrough views (`*_vw`) mirror naming used elsewhere for shadow reads.
 
 ## Composite ID strategy
 
+### Notes
+
 | Field | Meaning | Example |
 |-------|---------|---------|
 | `id` (PK) | `{source}-{sid}-{note_id}` | `boa-9000000001-900001` |
@@ -71,6 +73,14 @@ Passthrough views (`*_vw`) mirror naming used elsewhere for shadow reads.
 | `sid` | Student id | `9000000001` |
 
 Topics use the parent note's composite `id` plus `topic` as composite PK `(id, topic)`.
+
+### Comments
+
+| Field | Meaning | Example |
+|-------|---------|---------|
+| `id` | Source parent (appointment or eForm) id | `9abc123-de45-6f78-90ab-1cd234ef` (YCBM or Calendly), `9000000001-00001` (SIS) |
+| `boa_id` (PK) | Source comment id | `901` |
+| `composite_id` | `{parent_type}-comment-{boa_id}` | `appointment-comment-901` |
 
 ## Per-event writes
 

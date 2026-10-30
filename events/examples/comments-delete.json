@@ -1,0 +1,18 @@
+{
+  "Records": [
+    {
+      "messageId": "example-comments-delete-001",
+      "receiptHandle": "example-receipt-handle",
+      "body": "{\"table\":\"comments\",\"operation\":\"delete\",\"row\":{\"id\":900,\"comment_parent_id\":\"900f023-96ef-2ad8-39ec-829ca8e3\",\"parent_type\":\"appointment\"}}",
+      "attributes": {
+        "ApproximateReceiveCount": "1",
+        "SentTimestamp": "1609459200000"
+      },
+      "messageAttributes": {},
+      "md5OfBody": "example-md5",
+      "eventSource": "aws:sqs",
+      "eventSourceARN": "arn:aws:sqs:us-west-2:123456789012:example-queue.fifo",
+      "awsRegion": "us-west-2"
+    }
+  ]
+}

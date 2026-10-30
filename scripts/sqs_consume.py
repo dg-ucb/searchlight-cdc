@@ -56,6 +56,8 @@ def apply_handler_env(fe: dict) -> None:
         'DB_NAME',
         'RDS_SCHEMA_BOA_APP_RDS_DATA',
         'HANDLER_VERSION',
+        'COMMENTS_TABLE',
+        'APPT_COMMENT_FTS_TABLE',
         'NOTES_TABLE',
         'TOPICS_TABLE',
         'AUTHORS_TABLE',

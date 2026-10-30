@@ -32,7 +32,7 @@ from typing import Any
 Expected envelope shape (record body JSON):
 
     {
-      "table": "notes" | "note_topics",
+      "table": "notes" | "note_topics" | "comments",
       "operation": "create" | "update" | "delete" | "upsert",
       "row": { ... source columns ... }
     }

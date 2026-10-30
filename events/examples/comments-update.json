@@ -1,0 +1,18 @@
+{
+  "Records": [
+    {
+      "messageId": "example-comments-update-001",
+      "receiptHandle": "example-receipt-handle",
+      "body": "{\"table\":\"comments\",\"operation\":\"update\",\"row\":{\"id\":900,\"comment_parent_id\":\"900f023-96ef-2ad8-39ec-829ca8e3\",\"parent_type\":\"appointment\",\"author_uid\":\"90000001\",\"author_name\":\"Lorem Ipsum\",\"author_role\":\"Sample Advising Role\",\"author_dept_codes\":[\"DEPT01\"],\"body\":\"Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.\",\"created_at\":\"2020-01-01T12:00:00.000000+00:00\",\"updated_at\":\"2020-01-01T12:00:00.000000+00:00\"}}",
+      "attributes": {
+        "ApproximateReceiveCount": "1",
+        "SentTimestamp": "1609459200000"
+      },
+      "messageAttributes": {},
+      "md5OfBody": "example-md5",
+      "eventSource": "aws:sqs",
+      "eventSourceARN": "arn:aws:sqs:us-west-2:123456789012:example-queue.fifo",
+      "awsRegion": "us-west-2"
+    }
+  ]
+}
