@@ -1,108 +1,56 @@
 # Deployment
 
-Deploy lambda function code and dependencies to the AWS Cloud.
+CodePipeline deploys the Lambda with Terraform and either pins existing shared dependency layers or manages function-specific layers. The pipeline infrastructure and actual environment inputs live in a separate private infrastructure repository. This application repository contains the handler, `terraform/`, two Python deployment helpers, locked layer dependencies, and PR validation.
 
-TODO: Which method to use for deploying to dev, qa, prod?
-- Terraform (ops-managed)
-- SAM CLI
-- AWS CLI
-
-We wil probably use terraform for initial deployment to create the IAM role (this requires ops-level permissions).
-
-## First-time setup
-
-```bash
-cp .env.example .env.dev   # never commit .env.dev
-```
-Override the variables with ARNs of existing resources. These will be passed to `sam deploy` to avoid re-creating them. Assign empty string if a resource doesn't exist.
-
-## Build and package Python dependencies for deployment
-
-Production dependencies are provided to the handler via lambda layers.
-- boto3
-- psycopg2
-
-Other packages listed in requirements.txt are needed for local linting and testing only.
-
-### Build lambda layers using AWS SAM CLI
-
-Build an individual layer and output the .zip file to .aws-sam/build/
-
-```bash
-make build-Psycopg2Layer
+```text
+Developer PR → tests and packaging checks → merge to environment branch
+  → CodePipeline → test + package + Terraform plan → approval → Terraform apply
 ```
 
-Build the entire application including lambda function and layers configured the SAM template.
-```bash
-make build
+PR checks run without AWS credentials. The trusted environment branch starts the deployment pipeline. Dev, QA and production each use their own pipeline, Parameter Store paths, existing Lambda resources and state key.
+
+## Application release
+
+1. Change `lambda/` and submit a PR. The GitHub check runs unit and deployment-helper tests, builds Linux-compatible ZIPs, checks imports in the Lambda runtime container, and validates Terraform without a backend.
+2. Merge into the branch configured for the environment. CodePipeline fetches that commit through CodeConnections. The Plan CodeBuild project receives private inputs through native Parameter Store environment variables.
+3. `scripts/deploy.py plan` tests the application, builds `function.zip` and prepares the two dependency ZIPs, checks imports, then runs Terraform init, validate, plan and show. Shared mode downloads and verifies the pinned layer versions; dedicated mode builds the dependency ZIPs from locked requirements.
+4. Review the linked Terraform plan in the private artifact bucket and approve it in CodePipeline.
+5. The Apply project verifies the approved artifacts and current configuration, then runs `scripts/deploy.py apply`. It applies the saved plan with the already-built ZIPs. It does not rebuild or replan.
+
+Changing inputs after planning requires a fresh plan and approval. Destruction or replacement of the existing function, runtime role, queue or mapping requires a separate reviewed migration. Dedicated dependency layers publish new immutable versions and retain the previous versions. Shared consumers use only the exact configured versions and cannot publish or delete shared layers.
+
+## Configuration and existing resources
+
+Infrastructure administrators publish two SecureString documents per environment:
+
+```text
+/searchlight/<environment>/terraform/tfvars
+/searchlight/<environment>/terraform/backend
 ```
 
-### Build and deploy lambda layers using Docker and AWS CLI
+The private infrastructure Terraform owns these parameters. Developers do not add tfvars, backend values, credentials, account details or secrets to this repository. The pipeline writes temporary input files outside the source artifact and removes them when the helper exits. Saved Terraform plans still contain sensitive inputs and must remain private and encrypted.
 
-#### Package dependencies in lambda layers
+Reuse the existing Lambda Terraform state and import any missing existing resources once before enabling releases. Retire the previous root managing those same resources. This Terraform manages the Lambda, selected layer references, execution role/policies, FIFO queue and SQS mapping; it uses existing networking, database and Secrets Manager resources. SQL migrations are a separate operation.
 
-https://docs.aws.amazon.com/lambda/latest/dg/packaging-layers.html
+Set `DB_NAME` and `DB_SECRET_NAME` in the private environment configuration. Passwords remain in Secrets Manager. Enable `function_response_types = ["ReportBatchItemFailures"]` so failed CDC messages are retried, and leave deployed `LOCAL_DEV` unset.
 
-Install a specific version of psycopg2 inside a docker container and output the .zip file to ./layers/
+See [the application Terraform guide](../terraform/README.md) for inputs, existing resource addresses and state migration. The private pipeline README describes the infrastructure setup and its separate state.
 
-```bash
-arch -x86_64 scripts/create_layer.sh psycopg2-python313 psycopg2-binary==2.9.10
+## Local checks
+
+With Python 3.13 and Docker on Linux:
+
+```sh
+python scripts/deploy.py check
 ```
 
-#### Upload a layer to AWS Lambda
+To build and smoke-test the ZIPs from another development platform:
 
-https://docs.aws.amazon.com/lambda/latest/dg/creating-deleting-layers.html
-
-```bash
-aws lambda publish-layer-version \
-    --layer-name psycopg2-python313 \
-    --zip-file ./layers/psycopg2-python313.zip \
-    --compatible-runtimes python3.13
+```sh
+python scripts/package_lambda.py --smoke
 ```
 
-#### Add the layer to the lambda function
+Layer dependencies are pinned with hashes under `requirements-layers/`. Update those locks through a reviewed PR when upgrading dependencies. The established local development tools can still be used locally; the deployment pipeline does not invoke SAM or CloudFormation.
 
-https://docs.aws.amazon.com/lambda/latest/dg/adding-layers.html
 
-```bash
-aws lambda list-layers
-```
-```bash
-aws lambda update-function-configuration \
-    --function-name lambda_handler \
-    --layers LayerVersionArn1 LayerVersionArn2 ...
-```
-
-## Deploy the lambda function
-
-### Deploy lambda and layers using AWS SAM CLI
-
-Packages lambda function code in a .zip file and uploads it to an S3 bucket (aws-sam-cli-managed-default-*). Generates a CloudFormation changeset preview requiring confirmation to deploy.
-
-```bash
-# requires iam:PassRole permission
-make deploy-dev
-```
-
-### Deploy lambda function code only
-
-Updates code without requiring a CloudFormation deployment.
-
-```bash
-# requires iam:PassRole permission
-make sync-dev
-```
-
-### Deploy lambda using AWS CLI
-
-```bash
-aws lambda update-function-code \
-    --function-name lambda_handler \
-    --zip-file CDCHandler.zip
-```
-
-### Test deployed changes
-
-```bash
-make test-remote
-```
+For developer-owned, version-pinned shared dependency layers, see [shared layer deployment](shared-layers.md).

@@ -2,6 +2,10 @@
 """Build deterministic Lambda/layer ZIPs and check them in the Lambda runtime."""
 
 import argparse
+import base64
+import hashlib
+import json
+import re
 import shutil
 import stat
 import subprocess
@@ -9,6 +13,9 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
+from urllib.error import URLError
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, build_opener
 
 RUNTIME_IMAGE = 'public.ecr.aws/lambda/python@sha256:88654a34882b5665ca04b0c8177422abb4d97a5ac2c68701e9fee04bb20c20d5'
 COMPONENTS = ('function', 'boto3', 'psycopg2')
@@ -56,12 +63,95 @@ def check_sizes(release: Path) -> None:
         raise ValueError('Function and layers exceed the combined 250 MiB package limit')
 
 
-def build(root: Path) -> None:
-    """Package source plus hash-locked Linux wheels without SAM or AWS access."""
+def _aws_download_url(value: str) -> bool:
+    """Accept only the AWS HTTPS download URL returned by GetLayerVersion."""
+    if not isinstance(value, str):
+        return False
+    parsed = urlsplit(value)
+    return (
+        parsed.scheme == 'https'
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.port in (None, 443)
+        and bool(parsed.hostname)
+        and parsed.hostname.endswith(('.amazonaws.com', '.amazonaws.com.cn'))
+    )
+
+
+class _AWSRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _aws_download_url(newurl):
+            raise ValueError('Shared layer download redirected outside AWS HTTPS')
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_DOWNLOAD = build_opener(_AWSRedirect())
+
+
+def _layer_content(metadata: dict, arn: str) -> tuple[dict, bytes]:
+    """Bind the download metadata to a compatible, pinned layer version."""
+    if metadata.get('LayerVersionArn') != arn:
+        raise ValueError('AWS returned a different shared layer version')
+    for key, compatible in (('CompatibleRuntimes', 'python3.13'), ('CompatibleArchitectures', 'x86_64')):
+        if metadata.get(key) and compatible not in metadata[key]:
+            raise ValueError('The selected shared layer is incompatible with this runtime or architecture')
+    content = metadata.get('Content', {})
+    location = content.get('Location')
+    if not _aws_download_url(location):
+        raise ValueError('AWS did not return a valid HTTPS layer download URL')
+    try:
+        expected = base64.b64decode(content['CodeSha256'], validate=True)
+    except (KeyError, TypeError, ValueError):
+        raise ValueError('AWS did not return a valid shared layer checksum') from None
+    if len(expected) != hashlib.sha256().digest_size:
+        raise ValueError('AWS did not return a valid shared layer checksum')
+    return content, expected
+
+
+def shared_layer(arn: str, destination: Path) -> None:
+    """Download and authenticate the exact selected immutable layer ZIP."""
+    if not isinstance(arn, str) or not re.fullmatch(r'arn:aws:lambda:[a-z0-9-]+:[0-9]{12}:layer:[A-Za-z0-9_-]+:[1-9][0-9]*', arn):
+        raise ValueError('A shared layer must use a numbered version ARN')
+    result = subprocess.run(
+        [shutil.which('aws') or 'aws', 'lambda', 'get-layer-version-by-arn', '--arn', arn, '--output', 'json'],
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    content, expected = _layer_content(json.loads(result.stdout), arn)
+    reported_size = content.get('CodeSize')
+    if reported_size is not None and (type(reported_size) is not int or not 0 < reported_size <= MAX_COMPRESSED):
+        raise ValueError('Shared layer exceeds the compressed package limit')
+    try:
+        with _DOWNLOAD.open(content['Location'], timeout=60) as response:
+            if not _aws_download_url(response.geturl()):
+                raise ValueError('Shared layer download redirected outside AWS HTTPS')
+            payload = response.read(MAX_COMPRESSED + 1)
+    except (OSError, URLError):
+        # Presigned URLs include transient credentials; do not print them in logs.
+        raise ValueError('Unable to download the selected shared layer') from None
+    if len(payload) > MAX_COMPRESSED:
+        raise ValueError('Shared layer exceeds the compressed package limit')
+    if reported_size is not None and reported_size != len(payload):
+        raise ValueError('Shared layer size does not match AWS metadata')
+    if hashlib.sha256(payload).digest() != expected:
+        raise ValueError('Shared layer checksum does not match AWS metadata')
+    destination.write_bytes(payload)
+
+
+def build(root: Path, shared_layers: dict[str, str] | None = None) -> None:
+    """Package code; use pinned shared ZIPs or build hash-locked Linux wheels."""
+    if shared_layers is not None and (not isinstance(shared_layers, dict) or (shared_layers and set(shared_layers) != set(COMPONENTS[1:]))):
+        raise ValueError('Shared layers must include exactly boto3 and psycopg2')
     release = root / 'dist/release'
     shutil.rmtree(release, ignore_errors=True)
     release.mkdir(parents=True)
     archive_tree(root / 'lambda', release / 'function.zip')
+    if shared_layers:
+        for name in COMPONENTS[1:]:
+            shared_layer(shared_layers[name], release / f'{name}.zip')
+        check_sizes(release)
+        return
     with tempfile.TemporaryDirectory(prefix='searchlight-layers-') as directory:
         for name in COMPONENTS[1:]:
             layer = Path(directory) / name
@@ -137,7 +227,7 @@ def smoke(root: Path, image: str = RUNTIME_IMAGE) -> None:
                 '-e',
                 'PYTHONDONTWRITEBYTECODE=1',
                 '-e',
-                'PYTHONPATH=/var/task:/opt/python',
+                'PYTHONPATH=/var/task:/opt/python/lib/python3.13/site-packages:/opt/python',
                 '-v',
                 f'{task}:/var/task:ro',
                 '-v',

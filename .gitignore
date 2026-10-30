@@ -10,6 +10,25 @@ env.json
 terraform.tfvars
 terraform/*.tfvars
 !terraform/*.tfvars.example
+*.tfvars
+*.tfvars.json
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfplan.*
+terraform/backend*.hcl
+terraform/backend*.json
+terraform/*.backend.hcl
+terraform/*.backend.json
+# Backend inputs also stay private for nested publisher roots.
+*.backend.hcl
+*.backend.json
+terraform/**/backend*.hcl
+terraform/**/backend*.json
+terraform/plan*.txt
+terraform/plan*.json
+crash.log
+crash.*.log
 secrets.json
 credentials.json
 *.pem

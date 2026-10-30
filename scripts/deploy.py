@@ -82,9 +82,25 @@ def inputs():
         "Lambda inputs do not match this pipeline's account, region, function, role, or queue",
     )
     require(tfvars.get('artifacts_directory') is None, 'Artifact path overrides are prohibited')
-    names = {name: f'{expected["function_name"]}-{name}' for name in ('boto3', 'psycopg2')}
+    shared_layers = tfvars.get('shared_layer_version_arns', {})
+    require(isinstance(shared_layers, dict), 'Shared layer version ARNs must be a JSON object')
+    if shared_layers:
+        pattern = rf'arn:aws:lambda:{re.escape(expected["region"])}:{expected["allowed_account_id"]}:layer:[A-Za-z0-9_-]+:[1-9][0-9]*'
+        require(
+            set(shared_layers) == {'boto3', 'psycopg2'}
+            and all(isinstance(arn, str) and re.fullmatch(pattern, arn) for arn in shared_layers.values()),
+            'Pin both shared layers to numbered version ARNs in this pipeline account and Region',
+        )
     require(
-        all(key in names and names[key] == value for key, value in tfvars.get('dependency_layer_names', {}).items()),
+        shared_layers == json.loads(os.environ.get('EXPECTED_SHARED_LAYER_VERSION_ARNS', '{}')),
+        'Shared layer versions do not match the private pipeline permissions',
+    )
+    names = {name: f'{expected["function_name"]}-{name}' for name in ('boto3', 'psycopg2')}
+    layer_names = tfvars.get('dependency_layer_names', {})
+    require(
+        isinstance(layer_names, dict)
+        and (not shared_layers or not layer_names)
+        and all(key in names and names[key] == value for key, value in layer_names.items()),
         'Layer names must match the scoped pipeline permissions',
     )
     require(
@@ -138,11 +154,35 @@ def guard_plan(plan, tfvars):
         }
     )
     require(not plan.get('errored') and plan.get('complete', True), 'Terraform plan is incomplete')
+    shared_layers = tfvars.get('shared_layer_version_arns', {})
     for resource in plan.get('resource_changes', []):
         if resource.get('mode') == 'data':
             continue
         address, change = resource['address'], resource['change']
         require(address in allowed, f'Unexpected managed resource in plan: {address}')
+        if shared_layers and address == 'aws_lambda_function.cdc_handler':
+            require(
+                (change.get('after') or {}).get('layers') == [shared_layers[name] for name in ('boto3', 'psycopg2')]
+                and not (change.get('after_unknown') or {}).get('layers'),
+                'The Lambda plan must attach the exact approved shared layer versions',
+            )
+        if shared_layers and address in LAYERS and change['actions'] != ['no-op']:
+            dependency = json.loads(address.split('[', 1)[1][:-1])
+            before = change.get('before') or {}
+            layer_name = f'{tfvars["function_name"]}-{dependency}'
+            arn = rf'arn:aws:lambda:{re.escape(tfvars["region"])}:{tfvars["allowed_account_id"]}:layer:{re.escape(layer_name)}:[1-9][0-9]*'
+            require(
+                change['actions'] == ['delete']
+                and change.get('after') is None
+                and before.get('skip_destroy') is True
+                and before.get('layer_name') == layer_name
+                and isinstance(before.get('arn'), str)
+                and re.fullmatch(arn, before['arn']),
+                'Shared-layer deployments may only retire retained function-specific layer records',
+            )
+            # The AWS provider honors skip_destroy by removing only the state
+            # record. The physical immutable version is kept for other consumers.
+            continue
         if change['actions'] not in (['no-op'], ['create'], ['update']):
             retained_layer = (
                 address in LAYERS
@@ -195,9 +235,10 @@ def check(root):
     package_lambda.build(root)
     package_lambda.smoke(root, os.environ.get('LAMBDA_RUNTIME_IMAGE', package_lambda.RUNTIME_IMAGE))
     tf = install_terraform()
-    run(tf, '-chdir=terraform', 'fmt', '-check', cwd=root)
-    run(tf, '-chdir=terraform', 'init', '-backend=false', '-input=false', '-lockfile=readonly', cwd=root)
-    run(tf, '-chdir=terraform', 'validate', '-no-color', cwd=root)
+    run(tf, '-chdir=terraform', 'fmt', '-check', '-recursive', cwd=root)
+    for directory in ('terraform', 'terraform/shared-layers'):
+        run(tf, f'-chdir={directory}', 'init', '-backend=false', '-input=false', '-lockfile=readonly', cwd=root)
+        run(tf, f'-chdir={directory}', 'validate', '-no-color', cwd=root)
 
 
 def deploy(mode, source):
@@ -206,7 +247,7 @@ def deploy(mode, source):
         require(os.environ['CODEBUILD_RESOLVED_SOURCE_VERSION'] == os.environ['SOURCE_SHA'], 'Source revision mismatch')
     account = run('aws', 'sts', 'get-caller-identity', '--query', 'Account', '--output', 'text', capture=True).strip()
     require(account == os.environ['EXPECTED_ACCOUNT_ID'], 'Wrong AWS account')
-    require(not any((source / 'terraform').glob('*.tfvars*')), 'Do not commit Terraform environment inputs')
+    require(not any((source / 'terraform').rglob('*.tfvars*')), 'Do not commit Terraform environment inputs')
     require(not any((source / 'terraform').rglob('*.tf.json')), 'Use sealed .tf files rather than .tf.json configuration')
     tfvars, backend = inputs()
     if mode == 'apply':
@@ -232,7 +273,7 @@ def deploy(mode, source):
             state = set(run(*tfcmd, 'state', 'list', cwd=WORK, capture=True).splitlines())
             require(state >= CORE, 'Existing Lambda state is missing expected resources; verify the backend or import once')
         tests(WORK)
-        package_lambda.build(WORK)
+        package_lambda.build(WORK, tfvars.get('shared_layer_version_arns', {}))
         package_lambda.smoke(WORK, os.environ.get('LAMBDA_RUNTIME_IMAGE', package_lambda.RUNTIME_IMAGE))
         run(*tfcmd, 'validate', '-no-color', cwd=WORK)
         plan_dir = WORK / 'dist/plan'
@@ -293,7 +334,7 @@ def main():
     root = Path(__file__).resolve().parents[1]
     try:
         check(root) if args.command == 'check' else deploy(args.command, root)
-    except (ValueError, KeyError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
+    except (ValueError, KeyError, json.JSONDecodeError, zipfile.BadZipFile, subprocess.CalledProcessError) as error:
         parser.exit(1, f'Deployment stopped: {error}\n')
 
 

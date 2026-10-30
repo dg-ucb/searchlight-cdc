@@ -10,7 +10,7 @@ output "function_arn" {
 
 output "dependency_layer_arns" {
   description = "Immutable dependency layer versions attached to the function."
-  value       = { for dependency, layer in aws_lambda_layer_version.dependency : dependency => layer.arn }
+  value       = local.dependency_layer_arns
 }
 
 output "queue_url" {

@@ -1,15 +1,21 @@
 locals {
   artifacts_directory = coalesce(var.artifacts_directory, "${path.module}/../dist/release")
+  use_shared_layers   = length(var.shared_layer_version_arns) > 0
   dependency_names = merge({
     boto3    = "${var.function_name}-boto3"
     psycopg2 = "${var.function_name}-psycopg2"
   }, var.dependency_layer_names)
+  dependency_layer_arns = local.use_shared_layers ? {
+    for dependency, layer in data.aws_lambda_layer_version.shared : dependency => layer.arn
+    } : {
+    for dependency, layer in aws_lambda_layer_version.dependency : dependency => layer.arn
+  }
 }
 
 data "aws_partition" "current" {}
 
 resource "aws_lambda_layer_version" "dependency" {
-  for_each = toset(["boto3", "psycopg2"])
+  for_each = local.use_shared_layers ? toset([]) : toset(["boto3", "psycopg2"])
 
   filename                 = "${local.artifacts_directory}/${each.key}.zip"
   source_code_hash         = filebase64sha256("${local.artifacts_directory}/${each.key}.zip")
@@ -32,6 +38,22 @@ resource "aws_lambda_layer_version" "dependency" {
   }
 }
 
+data "aws_lambda_layer_version" "shared" {
+  for_each          = var.shared_layer_version_arns
+  layer_version_arn = each.value
+
+  lifecycle {
+    postcondition {
+      condition = (
+        self.arn == each.value &&
+        (length(self.compatible_runtimes) == 0 || contains(self.compatible_runtimes, var.runtime)) &&
+        (length(self.compatible_architectures) == 0 || contains(self.compatible_architectures, var.architectures[0]))
+      )
+      error_message = "A shared layer must resolve to its exact pinned version and support this function's runtime and architecture when compatibility metadata is declared."
+    }
+  }
+}
+
 resource "aws_lambda_function" "cdc_handler" {
   filename         = "${local.artifacts_directory}/function.zip"
   source_code_hash = filebase64sha256("${local.artifacts_directory}/function.zip")
@@ -44,8 +66,8 @@ resource "aws_lambda_function" "cdc_handler" {
   timeout          = var.timeout
 
   layers = [
-    aws_lambda_layer_version.dependency["boto3"].arn,
-    aws_lambda_layer_version.dependency["psycopg2"].arn,
+    local.dependency_layer_arns["boto3"],
+    local.dependency_layer_arns["psycopg2"],
   ]
 
   environment {

@@ -172,6 +172,31 @@ variable "dependency_layer_names" {
   }
 }
 
+variable "shared_layer_version_arns" {
+  description = "Optional exact boto3 and psycopg2 layer-version ARNs from private environment inputs. Empty keeps function-specific layers; setting both makes this deployment a read-only layer consumer."
+  type        = map(string)
+  default     = {}
+  nullable    = false
+
+  validation {
+    condition     = length(var.shared_layer_version_arns) == 0 || toset(keys(var.shared_layer_version_arns)) == toset(["boto3", "psycopg2"])
+    error_message = "shared_layer_version_arns must be empty or contain exactly boto3 and psycopg2."
+  }
+
+  validation {
+    condition = alltrue([
+      for arn in values(var.shared_layer_version_arns) :
+      can(regex("^arn:aws:lambda:${var.region}:${var.allowed_account_id}:layer:[A-Za-z0-9_-]{1,140}:[1-9][0-9]*$", arn))
+    ])
+    error_message = "Shared layers require full, numbered version ARNs in this function's AWS account and Region; latest, aliases and wildcards are not supported."
+  }
+
+  validation {
+    condition     = length(var.shared_layer_version_arns) == 0 || length(var.dependency_layer_names) == 0
+    error_message = "Do not combine shared_layer_version_arns with function-specific dependency_layer_names."
+  }
+}
+
 variable "queue_name" {
   description = "Existing FIFO queue name for the CDC event source."
   type        = string
