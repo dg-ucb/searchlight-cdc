@@ -35,7 +35,7 @@ import psycopg2
 import psycopg2.extras
 from batch import run_sqs_batch
 from logging_utils import log
-from mapping import effective_operation, is_delete_operation, map_note_row_to_payload
+from mapping import effective_operation, is_delete_operation, map_comment_row_to_payload, map_note_row_to_payload
 
 """Direct Table CDC Lambda (handler.lambda_handler).
 
@@ -59,12 +59,14 @@ class DirectTables:
     """Fully-qualified PostgreSQL table names for the direct schema."""
 
     schema: str
-    comments: str
-    comment_fts: str
+    appt_comments: str
+    appt_fts: str
+    eform_comments: str
+    eform_fts: str
     notes: str
+    note_fts: str
     topics: str
     authors: str
-    note_fts: str
     pending_topics: str
     cdc_log: str
     handler_version: str
@@ -75,12 +77,14 @@ def load_tables() -> DirectTables:
     schema = os.environ.get('RDS_SCHEMA_BOA_APP_RDS_DATA', 'boa_app_rds_data')
     return DirectTables(
         schema=schema,
-        comments=os.environ.get('COMMENTS_TABLE', f'{schema}.advising_appointment_comments'),
-        comment_fts=os.environ.get('APPT_COMMENT_FTS_TABLE', f'{schema}.appointment_comments_search_index'),
+        appt_comments=os.environ.get('APPT_COMMENTS_TABLE', f'{schema}.advising_appointment_comments'),
+        appt_fts=os.environ.get('APPT_COMMENT_FTS_TABLE', f'{schema}.advising_appointment_comments_search_index'),
+        eform_comments=os.environ.get('EFORM_COMMENTS_TABLE', f'{schema}.eform_comments'),
+        eform_fts=os.environ.get('EFORM_COMMENT_FTS_TABLE', f'{schema}.eform_comments_search_index'),
         notes=os.environ.get('NOTES_TABLE', f'{schema}.advising_notes'),
+        note_fts=os.environ.get('NOTE_FTS_TABLE', f'{schema}.advising_notes_search_index'),
         topics=os.environ.get('TOPICS_TABLE', f'{schema}.advising_note_topics'),
         authors=os.environ.get('AUTHORS_TABLE', f'{schema}.advising_note_authors_index'),
-        note_fts=os.environ.get('FTS_TABLE', f'{schema}.advising_notes_search_index'),
         pending_topics=os.environ.get(
             'PENDING_TOPICS_TABLE',
             f'{schema}.advising_note_topics_pending',
@@ -178,7 +182,7 @@ def process_comment(
     row: dict[str, Any],
     event_id: str,
 ) -> None:
-    """Upsert or delete a comment; writes CDC audit row in the same transaction."""
+    """Upsert or delete a comment associated with an appointment or eForm; writes CDC audit row in the same transaction."""
     t = load_tables()
 
     comment_id = str(row.get('id')) if row.get('id') is not None else None
@@ -192,9 +196,11 @@ def process_comment(
         raise ValueError("Comment row missing required 'parent_type' field")
 
     composite_id = f'{parent_type}-comment-{comment_id}'
+    comments_table = t.appt_comments if parent_type == 'appointment' else t.eform_comments
+    comment_parent_id_col = 'parent_appointment_id' if parent_type == 'appointment' else 'parent_eform_id'
 
     if is_delete_operation(operation, row):
-        cur.execute(f'DELETE FROM {t.comments} WHERE id = %s', (comment_id,))
+        cur.execute(f'DELETE FROM {comments_table} WHERE id = %s', (comment_id,))
         insert_cdc_log(
             cur,
             t,
@@ -219,17 +225,17 @@ def process_comment(
 
     if operation in ('create', 'update', 'upsert'):
         sql = f"""
-            INSERT INTO {t.comments} (
-                id, boa_id, author_uid, author_name, author_role,
+            INSERT INTO {comments_table} (
+                {comment_parent_id_col}, boa_id, author_uid, author_name, author_role,
                 author_dept_codes, body, created_at, updated_at
             )
             VALUES (
-                %(id)s, %(boa_id)s, %(author_uid)s, %(author_name)s, %(author_role)s,
+                %(comment_parent_id)s, %(boa_id)s, %(author_uid)s, %(author_name)s, %(author_role)s,
                 %(author_dept_codes)s, %(body)s, %(created_at)s, %(updated_at)s
             )
             ON CONFLICT (boa_id)
             DO UPDATE SET
-                id = EXCLUDED.id,
+                {comment_parent_id_col} = EXCLUDED.{comment_parent_id_col},
                 author_uid = EXCLUDED.author_uid,
                 author_name = EXCLUDED.author_name,
                 author_role = EXCLUDED.author_role,
@@ -238,17 +244,7 @@ def process_comment(
                 created_at = EXCLUDED.created_at,
                 updated_at = EXCLUDED.updated_at
         """
-        payload = {
-            'id': row.get('comment_parent_id'),
-            'boa_id': comment_id,
-            'author_uid': row.get('author_uid'),
-            'author_name': row.get('author_name'),
-            'author_role': row.get('author_role'),
-            'author_dept_codes': row.get('author_dept_codes'),
-            'body': row.get('body'),
-            'created_at': row.get('created_at'),
-            'updated_at': row.get('updated_at'),
-        }
+        payload = map_comment_row_to_payload(row)
         cur.execute(sql, payload)
         fts_status = update_comment_fts_index(cur, t, parent_type, comment_parent_id, comment_id, event_id)
         insert_cdc_log(
@@ -644,15 +640,24 @@ def update_comment_fts_index(
     boa_id: str,
     event_id: str,
 ) -> str:
-    """Rebuild FTS for one row from advising_appointment_comments table. Returns applied or warning."""
+    """Rebuild FTS for one row from comments table. Returns applied or warning."""
+    if parent_type == 'appointment':
+        comment_fts = t.appt_fts
+        comments_table = t.appt_comments
+        comment_parent_id_col = 'parent_appointment_id'
+    else:
+        comment_fts = t.eform_fts
+        comments_table = t.eform_comments
+        comment_parent_id_col = 'parent_eform_id'
+
     sql = f"""
-        INSERT INTO {t.comment_fts} (id, boa_id, fts_index)
+        INSERT INTO {comment_fts} ({comment_parent_id_col}, boa_id, fts_index)
         SELECT
-            id,
+            {comment_parent_id_col},
             boa_id,
             TO_TSVECTOR( 'english', COALESCE(body, '') || ' ' || author_name ) AS fts_index
-        FROM {t.comments}
-        WHERE id = %s AND boa_id = %s
+        FROM {comments_table}
+        WHERE {comment_parent_id_col} = %s AND boa_id = %s
         ON CONFLICT (boa_id) DO UPDATE SET fts_index = EXCLUDED.fts_index
     """
     cur.execute(sql, (comment_parent_id, boa_id))

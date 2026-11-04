@@ -75,8 +75,23 @@ def effective_operation(operation: str, row: dict[str, Any]) -> str:
     return operation.lower()
 
 
+def map_comment_row_to_payload(row: dict[str, Any]) -> dict[str, Any]:
+    """Map source comment row to *_comments column dict."""
+    return {
+        'comment_parent_id': row.get('comment_parent_id'),
+        'boa_id': row.get('id'),
+        'author_uid': row.get('author_uid'),
+        'author_name': row.get('author_name'),
+        'author_role': row.get('author_role'),
+        'author_dept_codes': row.get('author_dept_codes'),
+        'body': row.get('body'),
+        'created_at': row.get('created_at'),
+        'updated_at': row.get('updated_at'),
+    }
+
+
 def map_note_row_to_payload(row: dict[str, Any]) -> dict[str, Any]:
-    """Map source note row to advising_notes / advising_notes_delta column dict."""
+    """Map source note row to advising_notes column dict."""
     first_name, last_name = parse_author_name(row.get('author_name'))
 
     note_id = str(row['id']) if row.get('id') is not None else None
