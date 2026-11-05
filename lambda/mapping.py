@@ -104,7 +104,7 @@ def map_note_row_to_payload(row: dict[str, Any]) -> dict[str, Any]:
 
     return {
         'id': composite_id,
-        'sid': sid,
+        'student_sid': sid,
         'boa_id': note_id,
         'advisor_uid': row.get('author_uid'),
         'author_name': row.get('author_name'),
