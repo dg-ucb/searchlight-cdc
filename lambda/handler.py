@@ -200,7 +200,7 @@ def process_comment(
     comment_parent_id_col = 'parent_appointment_id' if parent_type == 'appointment' else 'parent_eform_id'
 
     if is_delete_operation(operation, row):
-        cur.execute(f'DELETE FROM {comments_table} WHERE id = %s', (comment_id,))
+        cur.execute(f'DELETE FROM {comments_table} WHERE boa_id = %s', (comment_id,))
         insert_cdc_log(
             cur,
             t,
@@ -332,14 +332,14 @@ def process_note(
 
         sql = f"""
             INSERT INTO {t.notes} (
-                id, sid, boa_id, advisor_uid, author_name,
+                id, student_sid, boa_id, advisor_uid, author_name,
                 advisor_first_name, advisor_last_name, author_dept_codes,
                 subject, note_body, is_private, contact_type,
                 parent_note_id, peer_advising_department_id,
                 set_date, created_at, updated_at
             )
             VALUES (
-                %(id)s, %(sid)s, %(boa_id)s, %(advisor_uid)s, %(author_name)s,
+                %(id)s, %(student_sid)s, %(boa_id)s, %(advisor_uid)s, %(author_name)s,
                 %(advisor_first_name)s, %(advisor_last_name)s, %(author_dept_codes)s,
                 %(subject)s, %(note_body)s, %(is_private)s, %(contact_type)s,
                 %(parent_note_id)s, %(peer_advising_department_id)s,
@@ -347,7 +347,7 @@ def process_note(
             )
             ON CONFLICT (id)
             DO UPDATE SET
-                sid = EXCLUDED.sid,
+                student_sid = EXCLUDED.student_sid,
                 boa_id = EXCLUDED.boa_id,
                 advisor_uid = EXCLUDED.advisor_uid,
                 author_name = EXCLUDED.author_name,
@@ -369,7 +369,7 @@ def process_note(
             cur,
             t,
             note_id,
-            payload.get('sid'),
+            payload.get('student_sid'),
             payload.get('boa_id'),
             event_id,
         )
@@ -423,7 +423,7 @@ def process_note_topic(
     if not topic:
         raise ValueError("Topic row missing required 'topic' field")
 
-    cur.execute(f'SELECT id, sid FROM {t.notes} WHERE boa_id = %s', (boa_id,))
+    cur.execute(f'SELECT id, student_sid FROM {t.notes} WHERE boa_id = %s', (boa_id,))
     note_row = cur.fetchone()
 
     if not note_row:
@@ -484,7 +484,7 @@ def process_note_topic(
         return
 
     composite_id = note_row.get('id') if hasattr(note_row, 'get') else note_row[0]
-    sid = note_row.get('sid') if hasattr(note_row, 'get') else note_row[1]
+    sid = note_row.get('student_sid') if hasattr(note_row, 'get') else note_row[1]
     prepared = {'id': composite_id, 'sid': sid, 'boa_id': boa_id, 'topic': topic}
 
     if is_delete_operation(operation, row):
