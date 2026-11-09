@@ -651,14 +651,19 @@ def update_comment_fts_index(
         comment_parent_id_col = 'parent_eform_id'
 
     sql = f"""
-        INSERT INTO {comment_fts} ({comment_parent_id_col}, boa_id, fts_index)
+        INSERT INTO {comment_fts} ({comment_parent_id_col}, boa_id, raw_text, fts_index, age_days)
         SELECT
             {comment_parent_id_col},
             boa_id,
-            TO_TSVECTOR( 'english', COALESCE(body, '') || ' ' || author_name ) AS fts_index
+            COALESCE(body, '') || ' ' || author_name AS raw_text,
+            TO_TSVECTOR('english', COALESCE(body, '') || ' ' || author_name) AS fts_index,
+            GREATEST(EXTRACT(EPOCH FROM (now() - created_at)), 0) / 86400.0 AS age_days
         FROM {comments_table}
         WHERE {comment_parent_id_col} = %s AND boa_id = %s
-        ON CONFLICT (boa_id) DO UPDATE SET fts_index = EXCLUDED.fts_index
+        ON CONFLICT (boa_id) DO UPDATE SET
+            raw_text = EXCLUDED.raw_text,
+            fts_index = EXCLUDED.fts_index,
+            age_days = EXCLUDED.age_days
     """
     cur.execute(sql, (comment_parent_id, boa_id))
     if cur.rowcount == 0:
@@ -691,7 +696,7 @@ def update_note_fts_index(
     """Rebuild FTS for one note from notes + topics tables. Returns applied or warning."""
     sql = f"""
         WITH note_data AS (
-            SELECT id, subject, note_body, author_name
+            SELECT id, subject, note_body, author_name, created_at
             FROM {t.notes}
             WHERE id = %s
         ),
@@ -704,20 +709,30 @@ def update_note_fts_index(
         fts_content AS (
             SELECT
                 nd.id,
+                (
+                  COALESCE(nd.subject, '')     || ' ' ||
+                  COALESCE(nd.note_body, '')   || ' ' ||
+                  COALESCE(ta.topics_text, '') || ' ' ||
+                  COALESCE(nd.author_name, '')
+                ) AS raw_text,
                 to_tsvector(
                     'english',
                     COALESCE(nd.subject, '')     || ' ' ||
                     COALESCE(nd.note_body, '')   || ' ' ||
                     COALESCE(ta.topics_text, '') || ' ' ||
                     COALESCE(nd.author_name, '')
-                ) AS fts_index
+                ) AS fts_index,
+                GREATEST(EXTRACT(EPOCH FROM (now() - nd.created_at)), 0) / 86400.0 AS age_days
             FROM note_data nd
             LEFT JOIN topic_agg ta ON nd.id = ta.id
         )
-        INSERT INTO {t.note_fts} (id, fts_index)
-        SELECT id, fts_index FROM fts_content
+        INSERT INTO {t.note_fts} (id, raw_text, fts_index, age_days)
+        SELECT id, raw_text, fts_index, age_days FROM fts_content
         WHERE id IS NOT NULL
-        ON CONFLICT (id) DO UPDATE SET fts_index = EXCLUDED.fts_index
+        ON CONFLICT (id) DO UPDATE SET
+            raw_text = EXCLUDED.raw_text,
+            fts_index = EXCLUDED.fts_index,
+            age_days = EXCLUDED.age_days
     """
     cur.execute(sql, (composite_id, composite_id))
     if cur.rowcount == 0:
