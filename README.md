@@ -56,7 +56,9 @@ make sam-test                  # invoke handler with a sample CDC event
 
 ## Deploy
 
-Terraform stack and deployment guide are planned for a follow-up PR. The handler expects:
+The application is deployed with Terraform through a separately managed CodePipeline. Pull requests run tests and packaging checks without AWS credentials. Merging to the configured environment branch triggers package → plan → approval → apply. See [terraform/README.md](terraform/README.md) for configuration and state migration.
+
+The public repository contains `terraform/`, `scripts/package_lambda.py`, and `scripts/deploy.py`. Pipeline infrastructure and environment inputs belong in a separate private infrastructure repository; CodeBuild reads those inputs from Parameter Store. The handler expects:
 
 - An existing SQS FIFO queue (event source mapping)
 - AWS Secrets Manager secret with DB credentials
@@ -65,3 +67,6 @@ Terraform stack and deployment guide are planned for a follow-up PR. The handler
 ## Security
 
 Do **not** commit `env.json`, `terraform.tfvars`, or other credentials. Use `env.json.example` and `terraform.tfvars.example` with placeholders only.
+
+
+For developer-owned, version-pinned shared dependency layers, see [shared layer deployment](docs/shared-layers.md).
