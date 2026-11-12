@@ -3,7 +3,7 @@
     {
       "messageId": "example-notes-delete-001",
       "receiptHandle": "example-receipt-handle",
-      "body": "{\"table\":\"notes\",\"operation\":\"update\",\"row\":{\"id\":900001,\"author_uid\":\"90000001\",\"author_name\":\"Lorem Ipsum\",\"author_role\":\"Sample Advising Role\",\"author_dept_codes\":[\"DEPT01\"],\"body\":\"Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.\",\"contact_type\":null,\"is_draft\":false,\"is_private\":false,\"parent_note_id\":null,\"peer_advising_department_id\":null,\"set_date\":null,\"sid\":\"9000000000001\",\"subject\":\"Lorem ipsum meeting notes\",\"created_at\":\"2020-01-01T12:00:00.000000+00:00\",\"deleted_at\":\"2020-01-03T12:00:00.000000+00:00\",\"updated_at\":\"2020-01-03T12:00:00.000000+00:00\",\"note_template_id\":null}}",
+      "body": "{\"table\":\"notes\",\"operation\":\"delete\",\"row\":{\"id\":900001,\"author_uid\":\"90000001\",\"author_name\":\"Lorem Ipsum\",\"author_role\":\"Sample Advising Role\",\"author_dept_codes\":[\"DEPT01\"],\"body\":\"Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.\",\"contact_type\":null,\"is_draft\":false,\"is_private\":false,\"parent_note_id\":null,\"peer_advising_department_id\":null,\"set_date\":null,\"sid\":\"9000000000001\",\"subject\":\"Lorem ipsum meeting notes\",\"created_at\":\"2020-01-01T12:00:00.000000+00:00\",\"deleted_at\":\"2020-01-03T12:00:00.000000+00:00\",\"updated_at\":\"2020-01-03T12:00:00.000000+00:00\",\"note_template_id\":null}}",
       "attributes": {
         "ApproximateReceiveCount": "1",
         "SentTimestamp": "1609459200000"

@@ -3,7 +3,7 @@
     {
       "messageId": "example-note-topics-delete-001",
       "receiptHandle": "example-receipt-handle",
-      "body": "{\"table\":\"note_topics\",\"operation\":\"update\",\"row\":{\"id\":900101,\"note_id\":900001,\"topic\":\"Sample Topic Alpha\",\"author_uid\":\"90000002\",\"deleted_at\":\"2020-01-03T12:00:00.000000+00:00\"}}",
+      "body": "{\"table\":\"note_topics\",\"operation\":\"delete\",\"row\":{\"id\":900101,\"note_id\":900001,\"topic\":\"Sample Topic Alpha\",\"author_uid\":\"90000002\",\"deleted_at\":\"2020-01-03T12:00:00.000000+00:00\"}}",
       "attributes": {
         "ApproximateReceiveCount": "1",
         "SentTimestamp": "1609459200000"

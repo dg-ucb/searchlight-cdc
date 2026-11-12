@@ -152,6 +152,8 @@ def insert_cdc_log(  # noqa: PLR0913
         )
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now(), %s)
         ON CONFLICT (event_id) DO UPDATE SET
+            table_name = EXCLUDED.table_name,
+            operation = EXCLUDED.operation,
             effective_operation = EXCLUDED.effective_operation,
             boa_id = EXCLUDED.boa_id,
             composite_id = EXCLUDED.composite_id,
