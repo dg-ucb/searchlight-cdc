@@ -149,7 +149,7 @@ def inputs():
     tfvars = json.loads(os.environ.pop('TFVARS_JSON'))
     backend = json.loads(os.environ.pop('BACKEND_JSON'))
     require(isinstance(tfvars, dict) and isinstance(backend, dict), 'SSM inputs must be JSON objects')
-    require(os.environ['ENVIRONMENT'] in ('dev', 'qa', 'production'), 'Unsupported environment')
+    require(os.environ['ENVIRONMENT'] in ('dev', 'qa', 'prod'), 'Unsupported environment')
     expected = {
         'allowed_account_id': os.environ['EXPECTED_ACCOUNT_ID'],
         'region': os.environ['AWS_DEFAULT_REGION'],
